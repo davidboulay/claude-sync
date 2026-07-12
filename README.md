@@ -64,16 +64,16 @@ The wizard asks two things — where your projects live, and the peer's address 
 - generates an SSH key and authorizes it on the peer (`ssh-copy-id`)
 - detects the peer's OS, home directory and projects folder
 - **installs Syncthing wherever it's missing, skips it where present** — static binary + systemd unit on Linux, Homebrew cask or official DMG on macOS
-- pairs the two Syncthing instances and shares the projects folder via the REST API on both ends (ignore patterns + 30-day trash can included) — no clicking through web GUIs
-- deploys the peer-side tools (SwiftBar plugin, rename helper, config) and starts the sync
+- pairs the two Syncthing instances and shares **both folders** (projects + session staging) via the REST API on both ends — no clicking through web GUIs
+- deploys the peer-side tools and the translate timer/agent, and starts syncing
 
-**More devices**: run `claude-sync-setup` again per device; everything meshes through Syncthing. Every step is check-first, so rerunning is always safe. (Current gap: the wizard shares the *projects* folder; for the *sessions* folder, add `claude-sessions` ↔ `~/.claude/sync-staging` to the new device via the Syncthing GUI or two REST calls — automation planned.)
+**More devices**: run `claude-sync-setup` again per device; existing devices are automatically included in every new share, so the mesh stays complete. Every step is check-first — rerunning is always safe.
 
-Device prereqs: SSH reachable once for deployment (macOS: System Settings → Sharing → Remote Login; Linux: sshd) — after setup, SSH is not used for syncing.
+**Always-on relay** (recommended): `claude-sync-setup relay` adds any always-on Syncthing device — a NAS, a Pi, a server. It needs **zero claude-sync code and no SSH**: paste its Syncthing device ID (plus optionally its GUI URL + API key for hands-off configuration, otherwise you accept the two folder offers in its GUI once). With a relay in the mesh, no two machines ever need to be awake together.
 
-`install-mac.sh` can also be run directly on a Mac from a clone (Syncthing carries the repo folder, so the clone is already there); it builds the menu-bar app and installs the translate agent.
+Device prereqs: SSH reachable once for deployment (macOS: System Settings → Sharing → Remote Login; Linux: sshd) — after setup, SSH is not used for syncing. Relays need no SSH at all.
 
-**Always-on relay**: add any always-on Syncthing device (NAS, server) to both folders. It needs zero claude-sync code — it just stores the canonical data and relays between machines that are never awake together.
+`install-mac.sh` can also be run directly on a Mac from a clone, or use the `.dmg` from the releases page (app + one-click CLI installer).
 
 ## Configuration
 
