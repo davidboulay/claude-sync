@@ -20,7 +20,8 @@ cp "$REPO"/linux/systemd/claude-session-sync.{service,timer} \
 sed "s|__HOME__|$HOME|g" "$REPO/linux/desktop/claude-sync-status.desktop" > ~/.local/share/applications/claude-sync-status.desktop
 sed "s|__HOME__|$HOME|g" "$REPO/linux/desktop/claude-sync-tray.desktop" > ~/.config/autostart/claude-sync-tray.desktop
 # peer-side files, staged for claude-sync-setup to deploy over ssh
-cp "$REPO/mac/claude-sync.60s.sh" "$REPO/mac/claude-rename-project" "$SHARE/peer-files/"
+cp "$REPO/mac/claude-sync.60s.sh" "$REPO/mac/claude-rename-project" \
+   "$REPO/mac/claude-sync-translate.plist" "$SHARE/peer-files/"
 cp "$REPO/stignore.template" "$SHARE/"
 systemctl --user daemon-reload
 
