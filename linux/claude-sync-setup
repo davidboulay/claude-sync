@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# claude-sync-setup — interactive wizard. Run on the hub (this Linux machine)
+# once per peer you want to connect. It will:
+#   1. configure the local projects root and ensure local Syncthing
+#      (downloads the static binary if missing — skipped if present)
+#   2. set up SSH to the peer (key generation + ssh-copy-id if needed)
+#   3. detect the peer's OS, home and projects root
+#   4. ensure Syncthing on the peer (brew cask / DMG on macOS, static binary
+#      + systemd unit on Linux — skipped if already installed)
+#   5. pair the two Syncthing instances and share the projects folder
+#      (ignore patterns + 30-day trash can), all via the REST API
+#   6. deploy the peer-side tools and config, start the sync timer
+#
+# Rerun anytime to add another peer or repair a step — every step is
+# check-first and skips what already exists.
+set -uo pipefail
+
+CFG_DIR="$HOME/.config/claude-sync"
+CFG="$CFG_DIR/config"
+SHARE="$HOME/.local/share/claude-sync"
+FOLDER_ID="claude-projects"
+
+say()  { printf '\033[1m== %s\033[0m\n' "$*"; }
+ok()   { printf '   \033[32m✓\033[0m %s\n' "$*"; }
+note() { printf '   \033[33m•\033[0m %s\n' "$*"; }
+die()  { printf '   \033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+ask()  { local v; read -rp "$1 [$2]: " v; echo "${v:-$2}"; }
+
+# ---------- local machine ----------------------------------------------------
+say "local machine"
+mkdir -p "$CFG_DIR" "$SHARE" "$HOME/.local/bin"
+# shellcheck disable=SC1090
+[[ -f "$CFG" ]] && source "$CFG"
+LOCAL_ROOT="${LOCAL_ROOT:-}"
+if [[ -z "$LOCAL_ROOT" ]]; then
+  LOCAL_ROOT="$(ask "Where do your Claude Code projects live" "$HOME/Claude")"
+  LOCAL_ROOT="${LOCAL_ROOT/#\~/$HOME}"
+fi
+mkdir -p "$LOCAL_ROOT"
+ok "projects root: $LOCAL_ROOT"
+[[ -f "$LOCAL_ROOT/.stignore" ]] || { cp "$SHARE/stignore.template" "$LOCAL_ROOT/.stignore" 2>/dev/null && ok "installed .stignore" || true; }
+
+# logo (needed by tray + badges)
+if [[ ! -f "$SHARE/claude-logo.png" ]]; then
+  curl -sL "https://raw.githubusercontent.com/lobehub/lobe-icons/refs/heads/master/packages/static-png/light/claudecode-color.png" \
+    -o "$SHARE/claude-logo.png" && ok "fetched Claude Code logo" || note "logo fetch failed (tray falls back to a drawn mark)"
+fi
+
+# local syncthing: use existing binary or fetch the static release
+if command -v syncthing >/dev/null 2>&1; then
+  ST_BIN="$(command -v syncthing)"; ok "syncthing present: $ST_BIN"
+elif [[ -x "$HOME/.local/bin/syncthing" ]]; then
+  ST_BIN="$HOME/.local/bin/syncthing"; ok "syncthing present: $ST_BIN"
+else
+  note "syncthing not found — downloading static binary"
+  arch="$(uname -m)"; case "$arch" in x86_64) a=amd64;; aarch64|arm64) a=arm64;; *) die "unsupported arch $arch";; esac
+  url=$(curl -sL https://api.github.com/repos/syncthing/syncthing/releases/latest \
+        | grep -o "\"browser_download_url\": *\"[^\"]*linux-$a[^\"]*\.tar\.gz\"" | cut -d'"' -f4 | head -1)
+  [[ -n "$url" ]] || die "could not resolve syncthing download URL"
+  tmp="$(mktemp -d)"; curl -sL "$url" | tar xz -C "$tmp"
+  find "$tmp" -maxdepth 2 -name syncthing -type f -exec cp {} "$HOME/.local/bin/" \;
+  rm -rf "$tmp"; ST_BIN="$HOME/.local/bin/syncthing"
+  ok "installed $($ST_BIN --version | head -c 40)…"
+fi
+if [[ "$(systemctl --user is-active syncthing.service 2>/dev/null)" != active ]]; then
+  systemctl --user daemon-reload
+  systemctl --user enable --now syncthing.service 2>/dev/null \
+    || die "syncthing.service missing — run install-linux.sh first"
+  sleep 5
+fi
+stcfg=$(ls "$HOME/.local/state/syncthing/config.xml" "$HOME/.config/syncthing/config.xml" 2>/dev/null | head -1)
+[[ -n "$stcfg" ]] || die "local syncthing config not found"
+LKEY=$(sed -n 's/.*<apikey>\(.*\)<\/apikey>.*/\1/p' "$stcfg" | head -1)
+lapi() { curl -s -m 10 -H "X-API-Key: $LKEY" "http://127.0.0.1:8384/rest/$1" "${@:2}"; }
+LOCAL_ID=$(lapi system/status | python3 -c 'import json,sys; print(json.load(sys.stdin)["myID"])')
+ok "local syncthing device: ${LOCAL_ID:0:7}…"
+loginctl enable-linger "$USER" 2>/dev/null || true
+
+# ---------- peer -------------------------------------------------------------
+say "peer"
+PEER="$(ask "Short name for the peer (letters/digits/_ only — becomes the ssh alias)" "mac")"
+[[ "$PEER" =~ ^[A-Za-z0-9_]+$ ]] || die "peer name must be letters/digits/underscore"
+if ! ssh -o ConnectTimeout=4 -o BatchMode=yes "$PEER" true 2>/dev/null; then
+  addr="$(ask "Peer address (hostname.local / IP / tailscale name)" "")"
+  [[ -n "$addr" ]] || die "no address given"
+  puser="$(ask "Username on the peer" "$USER")"
+  [[ -f "$HOME/.ssh/id_ed25519" ]] || ssh-keygen -t ed25519 -f "$HOME/.ssh/id_ed25519" -N "" -q
+  if ! grep -q "^Host $PEER\$" "$HOME/.ssh/config" 2>/dev/null; then
+    printf '\nHost %s\n    HostName %s\n    User %s\n    IdentityFile ~/.ssh/id_ed25519\n    ServerAliveInterval 15\n' \
+      "$PEER" "$addr" "$puser" >> "$HOME/.ssh/config"
+    ok "added ssh alias '$PEER'"
+  fi
+  note "authorizing key on the peer (you may be asked for its password)…"
+  ssh-copy-id "$PEER" || die "ssh-copy-id failed — enable Remote Login / sshd on the peer and retry"
+fi
+ok "ssh to '$PEER' works"
+
+POS="$(ssh -o BatchMode=yes "$PEER" uname)"
+PHOME="$(ssh -o BatchMode=yes "$PEER" 'echo $HOME')"
+def_root="$PHOME/$(basename "$LOCAL_ROOT")"
+PROOT="$(ask "Projects root on the peer" "$def_root")"
+ssh -o BatchMode=yes "$PEER" "mkdir -p '$PROOT'"
+ok "peer: $POS, home=$PHOME, root=$PROOT"
+
+# peer syncthing: skip if present, install if missing
+if [[ "$POS" == "Darwin" ]]; then
+  PCFG_ST="$PHOME/Library/Application Support/Syncthing/config.xml"
+  if ssh -o BatchMode=yes "$PEER" 'test -d /Applications/Syncthing.app || command -v syncthing >/dev/null || test -x /opt/homebrew/bin/syncthing' 2>/dev/null; then
+    ok "syncthing already on peer"
+  elif ssh -o BatchMode=yes "$PEER" 'command -v brew >/dev/null || test -x /opt/homebrew/bin/brew'; then
+    note "installing Syncthing.app via Homebrew cask…"
+    ssh -o BatchMode=yes "$PEER" 'PATH="/opt/homebrew/bin:$PATH" brew install --cask syncthing' || die "brew install failed"
+  else
+    note "installing Syncthing.app from the official DMG…"
+    ssh -o BatchMode=yes "$PEER" 'url=$(curl -sL https://api.github.com/repos/syncthing/syncthing-macos/releases/latest | grep -o "\"browser_download_url\": *\"[^\"]*\.dmg\"" | cut -d\" -f4 | head -1); curl -sL "$url" -o /tmp/syncthing.dmg && hdiutil attach -nobrowse -quiet /tmp/syncthing.dmg && cp -R "/Volumes/Syncthing/Syncthing.app" /Applications/ && hdiutil detach -quiet /Volumes/Syncthing' || die "DMG install failed"
+  fi
+  ssh -o BatchMode=yes "$PEER" 'defaults write com.github.xor-gate.syncthing-macosx StartAtLogin -bool true; pgrep -x syncthing >/dev/null || open -a Syncthing || open /Applications/Syncthing.app' || true
+else
+  PCFG_ST="$PHOME/.local/state/syncthing/config.xml"
+  if ssh -o BatchMode=yes "$PEER" 'command -v syncthing >/dev/null || test -x ~/.local/bin/syncthing'; then
+    ok "syncthing already on peer"
+  else
+    note "installing syncthing static binary on peer…"
+    parch="$(ssh -o BatchMode=yes "$PEER" uname -m)"; case "$parch" in x86_64) pa=amd64;; aarch64|arm64) pa=arm64;; *) die "unsupported peer arch $parch";; esac
+    ssh -o BatchMode=yes "$PEER" "mkdir -p ~/.local/bin && url=\$(curl -sL https://api.github.com/repos/syncthing/syncthing/releases/latest | grep -o '\"browser_download_url\": *\"[^\"]*linux-$pa[^\"]*\.tar\.gz\"' | cut -d'\"' -f4 | head -1) && curl -sL \"\$url\" | tar xz -C /tmp && find /tmp -maxdepth 2 -name syncthing -type f -exec cp {} ~/.local/bin/ \;" || die "peer install failed"
+  fi
+  ssh -o BatchMode=yes "$PEER" 'mkdir -p ~/.config/systemd/user && printf "[Unit]\nDescription=Syncthing\nAfter=network.target\n[Service]\nExecStart=%%h/.local/bin/syncthing serve --no-browser --no-restart --logflags=0\nRestart=on-failure\nSuccessExitStatus=3 4\n[Install]\nWantedBy=default.target\n" > ~/.config/systemd/user/syncthing.service; systemctl --user daemon-reload && systemctl --user enable --now syncthing.service && loginctl enable-linger $USER' \
+    || note "could not enable peer systemd unit over ssh — start syncthing on the peer manually once"
+fi
+note "waiting for peer syncthing to come up…"
+for _ in $(seq 1 15); do
+  ssh -o BatchMode=yes "$PEER" "test -f '$PCFG_ST'" 2>/dev/null && break; sleep 2
+done
+PKEY=$(ssh -o BatchMode=yes "$PEER" "sed -n 's/.*<apikey>\\(.*\\)<\\/apikey>.*/\\1/p' '$PCFG_ST' | head -1")
+[[ -n "$PKEY" ]] || die "could not read peer syncthing api key"
+papi() { ssh -o BatchMode=yes "$PEER" "curl -s -m 10 -H 'X-API-Key: $PKEY' 'http://127.0.0.1:8384/rest/$1' ${2:-}"; }
+PEER_ID=$(papi system/status | python3 -c 'import json,sys; print(json.load(sys.stdin)["myID"])')
+ok "peer syncthing device: ${PEER_ID:0:7}…"
+
+# ---------- pair + share folder ---------------------------------------------
+say "pairing syncthing and sharing the projects folder"
+lapi "config/devices/$PEER_ID" -X PUT -H "Content-Type: application/json" \
+  -d "{\"deviceID\":\"$PEER_ID\",\"name\":\"$PEER\"}" >/dev/null
+papi "config/devices/$LOCAL_ID" "-X PUT -H 'Content-Type: application/json' -d '{\"deviceID\":\"$LOCAL_ID\",\"name\":\"$(hostname -s)\"}'" >/dev/null
+vers='"versioning":{"type":"trashcan","params":{"cleanoutDays":"30"}}'
+devs="\"devices\":[{\"deviceID\":\"$LOCAL_ID\"},{\"deviceID\":\"$PEER_ID\"}"
+# include any previously-configured peers so the mesh stays complete
+for p in ${PEERS:-}; do
+  v="PEER_DEVICE_$p"; [[ -n "${!v:-}" && "${!v}" != "$PEER_ID" ]] && devs+=",{\"deviceID\":\"${!v}\"}"
+done
+devs+="]"
+lapi "config/folders/$FOLDER_ID" -X PUT -H "Content-Type: application/json" \
+  -d "{\"id\":\"$FOLDER_ID\",\"label\":\"Claude projects\",\"path\":\"$LOCAL_ROOT\",$devs,$vers}" >/dev/null
+papi "config/folders/$FOLDER_ID" "-X PUT -H 'Content-Type: application/json' -d '{\"id\":\"$FOLDER_ID\",\"label\":\"Claude projects\",\"path\":\"$PROOT\",$devs,$vers}'" >/dev/null
+scp -q "$LOCAL_ROOT/.stignore" "$PEER:'$PROOT/.stignore'" 2>/dev/null || true
+ok "folder '$FOLDER_ID' shared both ways (30-day trash can)"
+
+# ---------- deploy peer tools + config ----------------------------------------
+say "deploying peer tools"
+ssh -o BatchMode=yes "$PEER" 'mkdir -p ~/.local/bin ~/.local/share/claude-sync ~/.config/claude-sync ~/.claude'
+scp -q "$HOME/.local/bin/claude-mv-project" "$PEER:.local/bin/"
+ssh -o BatchMode=yes "$PEER" "cat > ~/.config/claude-sync/config" <<PEERCFG
+# claude-sync peer configuration (generated by claude-sync-setup)
+ROLE="peer"
+LOCAL_ROOT="$PROOT"
+ST_FOLDER_ID="$FOLDER_ID"
+HUB_DEVICE_ID="$LOCAL_ID"
+HUB_NAME="$(hostname -s)"
+PEERCFG
+if [[ "$POS" == "Darwin" ]]; then
+  scp -q "$SHARE/peer-files/claude-sync.60s.sh" "$PEER:.swiftbar/claude-sync.60s.sh" 2>/dev/null \
+    || { ssh -o BatchMode=yes "$PEER" 'mkdir -p ~/.swiftbar'; scp -q "$SHARE/peer-files/claude-sync.60s.sh" "$PEER:.swiftbar/"; }
+  scp -q "$SHARE/peer-files/claude-rename-project" "$PEER:.local/bin/"
+  ssh -o BatchMode=yes "$PEER" 'chmod +x ~/.local/bin/claude-rename-project ~/.local/bin/claude-mv-project ~/.swiftbar/claude-sync.60s.sh'
+  # menu-bar badges
+  if [[ -x "$HOME/.local/bin/claude-sync-tray" ]]; then
+    tmp="$(mktemp -d)"
+    for c in green amber red gray; do "$HOME/.local/bin/claude-sync-tray" --render-badge "$c" 36 "$tmp/badge-$c.png" >/dev/null; done
+    scp -q "$tmp"/badge-*.png "$PEER:.local/share/claude-sync/"; rm -rf "$tmp"
+  fi
+  # SwiftBar if brew is available
+  ssh -o BatchMode=yes "$PEER" 'PATH="/opt/homebrew/bin:$PATH"; command -v brew >/dev/null && { brew list --cask swiftbar >/dev/null 2>&1 || brew install --cask swiftbar; } ; defaults write com.ameba.SwiftBar PluginDirectory "$HOME/.swiftbar"; open -a SwiftBar 2>/dev/null' || note "SwiftBar not installed (no brew) — install from https://swiftbar.app"
+  ok "peer menu-bar indicator deployed"
+else
+  ssh -o BatchMode=yes "$PEER" 'chmod +x ~/.local/bin/claude-mv-project'
+  note "Linux peer: hub-side tray monitors it; only claude-mv-project deployed"
+fi
+
+# ---------- write hub config + go --------------------------------------------
+say "finishing"
+NEW_PEERS="${PEERS:-}"
+[[ " $NEW_PEERS " == *" $PEER "* ]] || NEW_PEERS="${NEW_PEERS:+$NEW_PEERS }$PEER"
+{
+  echo "# claude-sync hub configuration (generated by claude-sync-setup)"
+  echo "PEERS=\"$NEW_PEERS\""
+  echo "LOCAL_ROOT=\"$LOCAL_ROOT\""
+  echo "LOCAL_HOME=\"$HOME\""
+  echo "LOCAL_DEVICE_ID=\"$LOCAL_ID\""
+  echo "ST_FOLDER_ID=\"$FOLDER_ID\""
+  echo "MAX_AGE_DAYS=${MAX_AGE_DAYS:-45}"
+  for p in $NEW_PEERS; do
+    if [[ "$p" == "$PEER" ]]; then
+      echo "PEER_ROOT_$p=\"$PROOT\""
+      echo "PEER_HOME_$p=\"$PHOME\""
+      echo "PEER_DEVICE_$p=\"$PEER_ID\""
+    else
+      rv="PEER_ROOT_$p"; hv="PEER_HOME_$p"; dv="PEER_DEVICE_$p"
+      echo "PEER_ROOT_$p=\"${!rv:-}\""
+      echo "PEER_HOME_$p=\"${!hv:-}\""
+      echo "PEER_DEVICE_$p=\"${!dv:-}\""
+    fi
+  done
+} > "$CFG"
+ok "config written: $CFG"
+
+systemctl --user daemon-reload
+systemctl --user enable --now claude-session-sync.timer 2>/dev/null || note "timer unit missing — run install-linux.sh"
+note "running first session sync…"
+"$HOME/.local/bin/claude-session-sync" || true
+ok "all set. Check health anytime with: claude-sync-status"

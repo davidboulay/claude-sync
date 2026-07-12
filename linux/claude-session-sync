@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# claude-session-sync — sync Claude Code sessions/memory/skills between this
+# machine (the hub) and every configured peer, translating machine-specific
+# paths in flight.
+#
+# Claude Code keys each session store to the absolute project path (both in
+# the store directory name and in "cwd" fields inside the JSONL), so the same
+# project is invisible across machines. For each peer this script:
+#   - takes one batched mtime listing per side, newest-wins per file
+#   - transfers only changed files (tar over ssh), preserving mtimes
+#   - renames store dirs and rewrites embedded paths both ways
+#   - also merges ~/.claude/{skills,agents,commands} (rsync, no translation)
+#   - never deletes anything; skips quietly if a peer is unreachable
+#
+# Configuration: ~/.config/claude-sync/config (created by claude-sync-setup).
+set -euo pipefail
+
+CFG="${CLAUDE_SYNC_CONFIG:-$HOME/.config/claude-sync/config}"
+[[ -f "$CFG" ]] || { echo "no config at $CFG — run claude-sync-setup" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$CFG"
+: "${PEERS:?config missing PEERS}" "${LOCAL_ROOT:?config missing LOCAL_ROOT}"
+LOCAL_HOME="${LOCAL_HOME:-$HOME}"
+MAX_AGE_DAYS="${MAX_AGE_DAYS:-45}"   # old sessions are left alone (memory/ exempt)
+LIVE="$HOME/.claude/projects"
+
+encode() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'; }
+LOCAL_ROOT_ENC="$(encode "$LOCAL_ROOT")"
+LOCAL_HOME_ENC="$(encode "$LOCAL_HOME")"
+
+exec 9>"$HOME/.claude/.session-sync.lock"
+flock -n 9 || exit 0                                    # previous run still going
+
+total_pulled=0 total_pushed=0
+for PEER in $PEERS; do
+  rootvar="PEER_ROOT_$PEER"; PEER_ROOT="${!rootvar:-}"
+  homevar="PEER_HOME_$PEER"; PEER_HOME="${!homevar:-}"
+  if [[ -z "$PEER_ROOT" ]]; then
+    echo "skipping '$PEER': no PEER_ROOT_$PEER in config" >&2
+    continue
+  fi
+  SSH=(ssh -o ConnectTimeout=5 -o BatchMode=yes "$PEER")
+  PEER_ROOT_ENC="$(encode "$PEER_ROOT")"
+  PEER_HOME_ENC="$(encode "${PEER_HOME:-/}")"
+
+  "${SSH[@]}" "mkdir -p ~/.claude/projects ~/.claude/skills ~/.claude/agents ~/.claude/commands" 2>/dev/null || continue
+
+  # apply renames the user initiated on this peer BEFORE building listings —
+  # otherwise this run would re-push the old-name store and resurrect it
+  pending=$("${SSH[@]}" "cat ~/.claude/.pending-renames 2>/dev/null && rm -f ~/.claude/.pending-renames" 2>/dev/null || true)
+  if [[ -n "$pending" ]]; then
+    while IFS='|' read -r o n; do
+      [[ -n "$o" && -n "$n" ]] || continue
+      if "$HOME/.local/bin/claude-mv-project" --store-only "$o" "$n" >/dev/null 2>&1; then
+        echo "applied $PEER-initiated rename: $o -> $n"
+        notify-send -i "$HOME/.local/share/claude-sync/claude-logo.png" \
+          "Claude Sync" "Applied rename from $PEER: $o → $n" 2>/dev/null || true
+      fi
+    done <<< "$pending"
+  fi
+
+  # user-level skills/agents/commands: newest-wins union, no path translation
+  for d in skills agents commands; do
+    mkdir -p "$HOME/.claude/$d"
+    rsync -au --timeout=20 -e "ssh -o ConnectTimeout=5 -o BatchMode=yes" \
+      "$PEER:.claude/$d/" "$HOME/.claude/$d/" 2>/dev/null || true
+    rsync -au --timeout=20 -e "ssh -o ConnectTimeout=5 -o BatchMode=yes" \
+      "$HOME/.claude/$d/" "$PEER:.claude/$d/" 2>/dev/null || true
+  done
+
+  WORK="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$WORK'" EXIT
+
+  # --- listings: "<epoch> <relpath>", canonical key = peer-format relpath.
+  # BSD stat on macOS peers, GNU find -printf fallback on Linux peers.
+  declare -A RMT=() LOC=()
+  while IFS=' ' read -r epoch path; do
+    [[ "$path" == */* ]] || continue
+    RMT["${path#./}"]="$epoch"
+  done < <("${SSH[@]}" "cd ~/.claude/projects && { find . -type f \
+             \( -path '*/memory/*' -o -mtime -$MAX_AGE_DAYS \) \
+             ! -name '.sync.*' ! -name '._*' ! -name '.DS_Store' \
+             -exec stat -f '%m %N' {} + 2>/dev/null || \
+             find . -type f \( -path '*/memory/*' -o -mtime -$MAX_AGE_DAYS \) \
+             ! -name '.sync.*' ! -name '._*' ! -name '.DS_Store' \
+             -printf '%Ts ./%P\n'; }" 2>/dev/null)
+
+  # store-dir name translation: project-root prefix first, home prefix as
+  # fallback (covers projects outside the root, e.g. bare-home sessions)
+  to_peer() {
+    local top="${1%%/*}" rest="${1#*/}"
+    if [[ "$top" == "$LOCAL_ROOT_ENC" ]]; then top="$PEER_ROOT_ENC"
+    elif [[ "$top" == "$LOCAL_ROOT_ENC"-* ]]; then top="$PEER_ROOT_ENC${top#"$LOCAL_ROOT_ENC"}"
+    elif [[ -n "$PEER_HOME" && "$top" == "$LOCAL_HOME_ENC" ]]; then top="$PEER_HOME_ENC"
+    elif [[ -n "$PEER_HOME" && "$top" == "$LOCAL_HOME_ENC"-* ]]; then top="$PEER_HOME_ENC${top#"$LOCAL_HOME_ENC"}"
+    fi
+    echo "$top/$rest"
+  }
+  to_local() {
+    local top="${1%%/*}" rest="${1#*/}"
+    if [[ "$top" == "$PEER_ROOT_ENC" ]]; then top="$LOCAL_ROOT_ENC"
+    elif [[ "$top" == "$PEER_ROOT_ENC"-* ]]; then top="$LOCAL_ROOT_ENC${top#"$PEER_ROOT_ENC"}"
+    elif [[ -n "$PEER_HOME" && "$top" == "$PEER_HOME_ENC" ]]; then top="$LOCAL_HOME_ENC"
+    elif [[ -n "$PEER_HOME" && "$top" == "$PEER_HOME_ENC"-* ]]; then top="$LOCAL_HOME_ENC${top#"$PEER_HOME_ENC"}"
+    fi
+    echo "$top/$rest"
+  }
+  # content rewrites: root pair first (more specific), then home pair
+  SED_TO_LOCAL=(-e "s|$PEER_ROOT|$LOCAL_ROOT|g")
+  SED_TO_PEER=(-e "s|$LOCAL_ROOT|$PEER_ROOT|g")
+  if [[ -n "$PEER_HOME" ]]; then
+    SED_TO_LOCAL+=(-e "s|$PEER_HOME|$LOCAL_HOME|g")
+    SED_TO_PEER+=(-e "s|$LOCAL_HOME|$PEER_HOME|g")
+  fi
+
+  while IFS=' ' read -r epoch path; do
+    rel="${path#"$LIVE"/}"
+    [[ "$rel" == */* ]] || continue
+    LOC["$(to_peer "$rel")"]="$epoch"
+  done < <(find "$LIVE" -type f \
+             \( -path '*/memory/*' -o -mtime "-$MAX_AGE_DAYS" \) \
+             ! -name '.sync.*' ! -name '._*' ! -name '.DS_Store' \
+             -print0 | xargs -0 -r stat -c '%Y %n')
+
+  # --- pull: peer files newer than (or missing from) local
+  pulls=()
+  for key in "${!RMT[@]}"; do
+    [[ -z "${LOC[$key]:-}" || "${RMT[$key]}" -gt "${LOC[$key]}" ]] && pulls+=("$key")
+  done
+  if ((${#pulls[@]})); then
+    printf './%s\n' "${pulls[@]}" | "${SSH[@]}" "cd ~/.claude/projects && COPYFILE_DISABLE=1 tar -cf - -T -" |
+      tar -xf - --warning=no-unknown-keyword --exclude='._*' --exclude='.DS_Store' -C "$WORK"
+    while IFS= read -r -d '' f; do
+      rel="${f#"$WORK"/}"
+      dst="$LIVE/$(to_local "$rel")"
+      mkdir -p "$(dirname -- "$dst")"
+      tmp="$(mktemp "$(dirname -- "$dst")/.sync.XXXXXX")"
+      sed "${SED_TO_LOCAL[@]}" "$f" > "$tmp"
+      touch -r "$f" "$tmp"
+      mv -f "$tmp" "$dst"
+    done < <(find "$WORK" -type f -print0)
+    rm -rf "$WORK"; mkdir -p "$WORK"
+  fi
+
+  # --- push: local files newer than (or missing from) peer
+  npush=0
+  for key in "${!LOC[@]}"; do
+    if [[ -z "${RMT[$key]:-}" || "${LOC[$key]}" -gt "${RMT[$key]}" ]]; then
+      src="$LIVE/$(to_local "$key")"
+      mkdir -p "$WORK/$(dirname -- "$key")"
+      sed "${SED_TO_PEER[@]}" "$src" > "$WORK/$key"
+      touch -r "$src" "$WORK/$key"
+      ((npush+=1))
+    fi
+  done
+  if ((npush)); then
+    tar -cf - -C "$WORK" . | "${SSH[@]}" "tar -xpf - -C ~/.claude/projects"
+  fi
+  rm -rf "$WORK"; trap - EXIT
+
+  "${SSH[@]}" "date +%s > ~/.claude/.claude-sync-heartbeat" 2>/dev/null || true
+  echo "$PEER: pulled ${#pulls[@]}, pushed $npush"
+  total_pulled=$((total_pulled + ${#pulls[@]})); total_pushed=$((total_pushed + npush))
+  unset RMT LOC
+done
+echo "pulled $total_pulled, pushed $total_pushed"

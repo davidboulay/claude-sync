@@ -1,0 +1,9 @@
+.DS_Store
+._*
+*.sync-conflict-*
+.stversions/
+.claude/settings.local.json
+__pycache__/
+*.pyc
+refresh-snapshot.sh
+mac/menubar/.build/

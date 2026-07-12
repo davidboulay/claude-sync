@@ -1,0 +1,8 @@
+[Unit]
+Description=Translate Claude Code sessions to/from the synced canonical staging store
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/claude-session-translate
+Nice=10
+IOSchedulingClass=idle

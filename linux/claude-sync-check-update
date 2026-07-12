@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# claude-sync-check-update — is a newer version available / deployed?
+#
+# Two comparisons (the repo working copy syncs between machines via Syncthing,
+# so "update" means two different things):
+#   1. origin/main has commits our repo copy lacks   → "pull available"
+#   2. repo HEAD differs from what's installed        → "reinstall needed"
+#
+# Output (machine-readable, one line):  ok | pull:<n> | reinstall | unknown
+# With --apply: pulls and/or reruns the platform installer as needed.
+# The installed marker is written by the install scripts.
+set -uo pipefail
+
+REPO="${CLAUDE_SYNC_REPO:-$HOME/Claude/claude-sync}"
+MARKER="$HOME/.local/share/claude-sync/installed-version"
+CACHE="$HOME/.local/share/claude-sync/.update-check"
+[[ -d "$REPO/.git" ]] || { echo "unknown"; exit 0; }
+
+# indicators poll every minute — only actually fetch every 30 min
+if [[ "${1:-}" != "--apply" && "${1:-}" != "--fresh" && -f "$CACHE" ]]; then
+  if [[ -n "$(find "$CACHE" -mmin -30 2>/dev/null)" ]]; then
+    cat "$CACHE"; exit 0
+  fi
+fi
+
+git -C "$REPO" fetch --quiet origin main 2>/dev/null || true
+behind=$(git -C "$REPO" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
+head=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)
+installed=$(cat "$MARKER" 2>/dev/null || echo none)
+
+state="ok"
+[[ "$installed" != "$head" ]] && state="reinstall"
+[[ "$behind" -gt 0 ]] && state="pull:$behind"
+mkdir -p "$(dirname "$CACHE")"; echo "$state" > "$CACHE"
+
+if [[ "${1:-}" == "--apply" ]]; then
+  if [[ "$behind" -gt 0 ]]; then
+    git -C "$REPO" pull --ff-only origin main || { echo "pull failed (diverged?)"; exit 1; }
+  fi
+  head=$(git -C "$REPO" rev-parse --short HEAD)
+  if [[ "$(cat "$MARKER" 2>/dev/null)" != "$head" ]]; then
+    if [[ "$(uname)" == "Darwin" ]]; then "$REPO/install-mac.sh"; else "$REPO/install-linux.sh"; fi
+  fi
+  echo "updated to $head"
+  exit 0
+fi
+echo "$state"

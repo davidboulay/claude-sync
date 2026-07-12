@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Claude Sync Status
+Comment=Health check for Linux↔Mac Claude session and project sync
+Exec=cosmic-term -e __HOME__/.local/bin/claude-sync-status --wait
+Icon=claude-sync
+Terminal=false
+Categories=Utility;
+Keywords=sync;claude;mac;syncthing;

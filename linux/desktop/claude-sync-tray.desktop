@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Claude Sync Tray
+Comment=Panel indicator for Linux↔Mac Claude sync health
+Exec=__HOME__/.local/bin/claude-sync-tray
+Icon=claude-sync
+Terminal=false
+X-GNOME-Autostart-enabled=true

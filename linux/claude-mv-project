@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# claude-mv-project OLD NEW — rename a project under the configured projects
+# root and migrate its Claude Code sessions + memory to the new path, on this
+# machine and every configured peer.
+#
+# Also repairs after a file-manager rename (folder already moved): detects it,
+# migrates the stores, and merges if new-path sessions already exist.
+#
+#   --store-only   migrate the session store only (no folder rename, no peers)
+#   CMP_BASE=...   base path the sessions are keyed under (default: the root),
+#                  e.g. CMP_BASE="$HOME" for moves from outside the root
+#
+# Run while no Claude session is open in that project.
+set -euo pipefail
+
+CFG="${CLAUDE_SYNC_CONFIG:-$HOME/.config/claude-sync/config}"
+# shellcheck disable=SC1090
+[[ -f "$CFG" ]] && source "$CFG"
+ROOT="${CMP_ROOT:-${LOCAL_ROOT:-$HOME/Claude}}"
+STORE="${CMP_STORE:-$HOME/.claude/projects}"
+BASEPATH="${CMP_BASE:-$ROOT}"          # absolute path embedded in sessions
+STAGE="${CST_STAGE:-$HOME/.claude/sync-staging}"
+
+STORE_ONLY=0
+if [[ "${1:-}" == "--store-only" ]]; then STORE_ONLY=1; shift; fi
+OLD="${1:?usage: claude-mv-project [--store-only] OLD NEW}"
+NEW="${2:?usage: claude-mv-project [--store-only] OLD NEW}"
+
+encode() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'; }
+
+old_abs="$BASEPATH/$OLD"
+new_abs="$BASEPATH/$NEW"
+enc_old="$(encode "$old_abs")"
+enc_new="$(encode "$new_abs")"
+
+migrate_store() {
+  local moved=0 d f cwd newd sf tmp
+  for d in "$STORE/$enc_old" "$STORE/$enc_old-"*; do
+    [[ -d "$d" ]] || continue
+    # encoding is lossy (foo-bar vs foo/bar): confirm via a session's cwd
+    f="$(find "$d" -maxdepth 1 -name '*.jsonl' 2>/dev/null | head -1)"
+    if [[ -n "$f" ]]; then
+      cwd="$(grep -m1 -o '"cwd":"[^"]*"' "$f" | head -1 | cut -d'"' -f4)"
+      if [[ -n "$cwd" && "$cwd" != "$old_abs" && "$cwd" != "$old_abs"/* ]]; then
+        continue   # different project that happens to share the encoded prefix
+      fi
+    elif [[ "$d" != "$STORE/$enc_old" ]]; then
+      echo "  ? skipping $d (no session file to confirm identity)" >&2
+      continue
+    fi
+    newd="$STORE/$enc_new${d#"$STORE/$enc_old"}"
+    # rewrite paths WITHOUT touching mtimes — the sync layer is newest-wins,
+    # so bumping mtimes here makes stale copies look fresh and fan out
+    while IFS= read -r -d '' sf; do
+      tmp="$(mktemp "$(dirname -- "$sf")/.mig.XXXXXX")"
+      sed -e "s|$old_abs/|$new_abs/|g" -e "s|$old_abs\"|$new_abs\"|g" "$sf" > "$tmp"
+      touch -r "$sf" "$tmp"
+      mv -f "$tmp" "$sf"
+    done < <(find "$d" -type f ! -name '.mig.*' -print0)
+    if [[ -e "$newd" ]]; then
+      # new-path sessions already exist (claude ran after a UI rename): merge
+      cp -a "$d"/. "$newd"/ && rm -rf "$d"
+      echo "  ✓ store: $(basename -- "$d") merged into existing $(basename -- "$newd")"
+    else
+      mv "$d" "$newd"
+      echo "  ✓ store: $(basename -- "$d") → $(basename -- "$newd")"
+    fi
+    moved=1
+  done
+  [[ "$moved" == 1 ]] || echo "  (no session store found for $old_abs — nothing to migrate)"
+}
+
+if [[ "$STORE_ONLY" == 1 ]]; then
+  migrate_store
+  exit 0
+fi
+
+if [[ -d "$ROOT/$OLD" && ! -e "$ROOT/$NEW" ]]; then
+  echo "renaming project folder…"
+  mv "$ROOT/$OLD" "$ROOT/$NEW"
+  echo "  ✓ $ROOT/$OLD → $ROOT/$NEW (Syncthing will rename it on peers)"
+  # nudge syncthing to scan NOW — narrows the window where another machine
+  # can modify old-name files and resurrect the folder (delete-vs-modify)
+  for c in "$HOME/.local/state/syncthing/config.xml" \
+           "$HOME/.config/syncthing/config.xml" \
+           "$HOME/Library/Application Support/Syncthing/config.xml"; do
+    if [[ -f "$c" ]]; then
+      k="$(sed -n 's/.*<apikey>\(.*\)<\/apikey>.*/\1/p' "$c" | head -1)"
+      curl -s -m 5 -X POST -H "X-API-Key: $k" \
+        "http://127.0.0.1:8384/rest/db/scan?folder=${ST_FOLDER_ID:-claude-projects}" >/dev/null 2>&1 || true
+      curl -s -m 5 -X POST -H "X-API-Key: $k" \
+        "http://127.0.0.1:8384/rest/db/scan?folder=${ST_SESSIONS_FOLDER_ID:-claude-sessions}" >/dev/null 2>&1 || true
+      break
+    fi
+  done
+elif [[ ! -e "$ROOT/$OLD" && -d "$ROOT/$NEW" ]]; then
+  echo "folder already renamed (file manager?) — migrating session stores only"
+elif [[ -e "$ROOT/$OLD" && -e "$ROOT/$NEW" ]]; then
+  echo "error: both $ROOT/$OLD and $ROOT/$NEW exist — resolve manually" >&2; exit 1
+else
+  echo "error: neither $ROOT/$OLD nor $ROOT/$NEW exists" >&2; exit 1
+fi
+
+echo "migrating local session store…"
+migrate_store
+
+# queue the store migration for every other device — each one's translator
+# applies it from the synced staging folder (works even if they're asleep now)
+if [[ -d "$STAGE" ]]; then
+  HOSTTAG="$(hostname -s | tr -c 'A-Za-z0-9' '-' | sed 's/-*$//')"
+  mkdir -p "$STAGE/_control"
+  printf '%s|%s|%s|%s\n' "$(date +%s)" "$HOSTTAG" "$OLD" "$NEW" >> "$STAGE/_control/renames-$HOSTTAG"
+  echo "  ✓ queued for other devices (their translators apply it within minutes)"
+else
+  echo "  ⚠ no staging folder — other devices need: claude-mv-project --store-only '$OLD' '$NEW'"
+fi
+echo "done."

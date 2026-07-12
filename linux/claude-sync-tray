@@ -1,0 +1,712 @@
+#!/usr/bin/env python3
+"""Panel tray indicator for Claude Linux<->Mac sync health.
+
+Badge colors: green = healthy & mirrored, amber = Mac away or transfer
+running, red = a local service is down.
+
+Left-click toggles a popup status card (single instance; closes when you
+click anywhere outside it). Right-click for the menu.
+
+COSMIC notes: tray creation is gated on org.kde.StatusNotifierWatcher and
+recreated if the watcher's owner changes (panel restart) — Qt caches tray
+availability at first call, so creating too early breaks autostart. The app
+runs on xcb (XWayland) so the popup can be positioned near the cursor and
+take focus; the tray itself is D-Bus (SNI) and doesn't care.
+"""
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+from PyQt6.QtCore import QEvent, Qt, QTimer
+from PyQt6.QtDBus import QDBusConnection, QDBusServiceWatcher
+from PyQt6.QtGui import QAction, QColor, QCursor, QIcon, QPainter, QPen, QPixmap
+from PyQt6.QtWidgets import (QApplication, QComboBox, QDialog, QDialogButtonBox,
+                             QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
+                             QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget)
+
+def _load_config():
+    cfg = {}
+    p = Path(os.environ.get("CLAUDE_SYNC_CONFIG",
+                            Path.home() / ".config/claude-sync/config"))
+    if p.is_file():
+        for line in p.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            cfg[k.strip()] = v.strip().strip('"').strip("'")
+    return cfg
+
+
+CONF = _load_config()
+WATCHER = "org.kde.StatusNotifierWatcher"
+CLAUDE_ROOT = Path(os.environ.get("CS_ROOT",
+                                  CONF.get("LOCAL_ROOT", Path.home() / "Claude")))
+SESSION_STORE = Path(os.environ.get("CS_STORE", Path.home() / ".claude/projects"))
+ST_FOLDER = CONF.get("ST_FOLDER_ID", "claude-projects")
+PEERS = CONF.get("PEERS", "").split()
+PEER_DEVICES = {p: CONF.get(f"PEER_DEVICE_{p}", "") for p in PEERS}
+
+
+def installed_version():
+    base = Path.home() / ".local/share/claude-sync"
+    try:
+        rel = (base / "installed-release").read_text().strip()
+    except OSError:
+        rel = ""
+    try:
+        h = (base / "installed-version").read_text().strip()[:7]
+    except OSError:
+        h = ""
+    return f"v{rel}" + (f" ({h})" if h else "") if rel else (h or "dev")
+COLORS = {"green": "#4caf50", "blue": "#4a90d9", "amber": "#e0a030",
+          "red": "#d84040", "gray": "#909090"}
+CLAUDE_TERRACOTTA = "#D97757"
+LOGO_PATH = Path.home() / ".local/share/claude-sync/claude-logo.png"
+LINE_COLORS = {"✓": "#6cbf6c", "●": "#e0a030", "◐": "#e0a030", "○": "#4a90d9",
+               "✗": "#d84040", "?": "#909090"}
+
+
+def _draw_starburst(p: QPainter, size: int) -> None:
+    """Fallback mark if the logo file is missing."""
+    import math
+    from PyQt6.QtCore import QPointF
+    from PyQt6.QtGui import QPolygonF
+    s = size / 64.0
+    cx = cy = 30 * s
+    p.setBrush(QColor(CLAUDE_TERRACOTTA))
+    p.setPen(Qt.PenStyle.NoPen)
+    for i in range(12):
+        a = (2 * 3.141592653589793 / 12) * i - 3.141592653589793 / 2
+        length = (26 if i % 2 == 0 else 19) * s
+        halfw = 3.6 * s
+        dx, dy = math.cos(a), math.sin(a)
+        px, py = -dy, dx
+        p.drawPolygon(QPolygonF([
+            QPointF(cx + px * halfw, cy + py * halfw),
+            QPointF(cx - px * halfw, cy - py * halfw),
+            QPointF(cx + dx * length, cy + dy * length),
+        ]))
+
+
+def make_pixmap(color: str | None, size: int = 64) -> QPixmap:
+    """Claude Code logo; optional status badge bottom-right."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    src = QPixmap(str(LOGO_PATH))
+    if not src.isNull():
+        scaled = src.scaled(size, size,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation)
+        p.drawPixmap((size - scaled.width()) // 2,
+                     (size - scaled.height()) // 2, scaled)
+    else:
+        _draw_starburst(p, size)
+    if color is not None:
+        s = size / 64.0
+        r = 17 * s
+        x = size - r - 1 * s
+        pen = QPen(QColor("#1e1e1e"))
+        pen.setWidthF(2 * s)
+        p.setPen(pen)
+        p.setBrush(QColor(COLORS[color]))
+        p.drawEllipse(int(x), int(x), int(r), int(r))
+    p.end()
+    return pm
+
+
+def make_icon(color: str) -> QIcon:
+    return QIcon(make_pixmap(color))
+
+
+def st_api(path: str):
+    cfgs = [Path.home() / ".local/state/syncthing/config.xml",
+            Path.home() / ".config/syncthing/config.xml"]
+    cfg = next((c for c in cfgs if c.exists()), None)
+    if not cfg:
+        return None
+    m = re.search(r"<apikey>([^<]+)</apikey>", cfg.read_text())
+    if not m:
+        return None
+    req = urllib.request.Request(f"http://127.0.0.1:8384/rest/{path}",
+                                 headers={"X-API-Key": m.group(1)})
+    import json
+    with urllib.request.urlopen(req, timeout=3) as r:
+        return json.load(r)
+
+
+def unit_active(unit: str) -> bool:
+    r = subprocess.run(["systemctl", "--user", "is-active", unit],
+                       capture_output=True, text=True)
+    return r.stdout.strip() == "active"
+
+
+def detect_renames():
+    """Find session stores whose project folder no longer exists.
+
+    Returns [(old_top_level_name, best_guess_new_name_or_None), ...]
+    """
+    import difflib
+    prefix = str(CLAUDE_ROOT) + "/"
+    orphans = []
+    seen = set()
+    if not SESSION_STORE.is_dir():
+        return []
+    for d in sorted(SESSION_STORE.iterdir()):
+        if not d.is_dir():
+            continue
+        f = next(iter(sorted(d.glob("*.jsonl"))), None)
+        if f is None:
+            continue
+        try:
+            head = f.open("rb").read(65536).decode("utf-8", "replace")
+        except OSError:
+            continue
+        m = re.search(r'"cwd":"([^"]+)"', head)
+        if not m or not m.group(1).startswith(prefix):
+            continue
+        top = m.group(1)[len(prefix):].split("/")[0]
+        if top in seen:
+            continue
+        seen.add(top)
+        if not (CLAUDE_ROOT / top).exists():
+            orphans.append(top)
+    if not orphans:
+        return []
+    folders = [p.name for p in CLAUDE_ROOT.iterdir()
+               if p.is_dir() and not p.name.startswith(".")]
+    out = []
+    for old in orphans:
+        best = difflib.get_close_matches(old, folders, n=1, cutoff=0.6)
+        out.append((old, best[0] if best else None))
+    return out
+
+
+def check_status():
+    """Return (color, [status lines])."""
+    lines = []
+    color = "green"
+
+    timer_ok = unit_active("claude-session-sync.timer")
+    st_ok = unit_active("syncthing.service")
+    if not timer_ok or not st_ok:
+        color = "red"
+        if not timer_ok:
+            lines.append("✗ session-sync timer DOWN")
+        if not st_ok:
+            lines.append("✗ syncthing DOWN")
+
+    if st_ok:
+        try:
+            conns = st_api("system/connections")["connections"]
+            here = st_api(f"db/completion?folder={ST_FOLDER}")
+            pending = here["needBytes"]
+            if pending > 0:
+                lines.append(f"◐ this machine: {here['completion']:.0f}% "
+                             f"({pending // 1_000_000} MB left)")
+            for p in PEERS:
+                did = PEER_DEVICES.get(p)
+                if not did:
+                    continue
+                p_conn = conns.get(did, {}).get("connected", False)
+                d = st_api(f"db/completion?folder={ST_FOLDER}&device={did}")
+                pending += d["needBytes"]
+                if p_conn:
+                    lines.append(f"✓ {p} connected")
+                    if d["needBytes"] > 0:
+                        lines.append(f"◐ {p}: {d['completion']:.0f}% "
+                                     f"({d['needBytes'] // 1_000_000} MB left)")
+                        if color == "green":
+                            color = "amber"
+                elif d["needBytes"] > 0:
+                    # offline WITH data queued — worth amber attention
+                    lines.append(f"● {p} offline — "
+                                 f"{d['needBytes'] // 1_000_000} MB queued, "
+                                 "delivers when it's back")
+                    if color == "green":
+                        color = "amber"
+                else:
+                    # offline but fully delivered — calm blue, not a warning
+                    lines.append(f"○ {p} offline — nothing pending")
+                    if color == "green":
+                        color = "blue"
+            if pending == 0:
+                lines.append("✓ projects fully mirrored")
+        except Exception:
+            lines.append("? syncthing API not answering")
+            if color == "green":
+                color = "amber"
+
+    r = subprocess.run(
+        ["journalctl", "--user", "-u", "claude-session-sync.service",
+         "--since", "2 hours ago", "--no-pager", "-o", "cat"],
+        capture_output=True, text=True)
+    transfers = [l for l in r.stdout.splitlines() if l.startswith("pulled")]
+    if transfers:
+        lines.append(f"✓ sessions: last run {transfers[-1]}")
+    else:
+        lines.append("● sessions: no transfer in 2 h (Mac away?)")
+
+    try:
+        for old, guess in detect_renames():
+            lines.append(f"● '{old}' sessions orphaned (folder renamed?)")
+            if color == "green":
+                color = "amber"
+    except Exception:
+        pass
+
+    upd = subprocess.run(
+        [str(Path.home() / ".local/bin/claude-sync-check-update")],
+        capture_output=True, text=True).stdout.strip()
+    if upd.startswith("pull:"):
+        lines.append(f"● update available ({upd[5:]} new commits) — menu → Update")
+        if color == "green":
+            color = "amber"
+    elif upd == "reinstall":
+        lines.append("● new version synced — menu → Update")
+
+    return color, lines
+
+
+class RenameDialog(QDialog):
+    def __init__(self):
+        super().__init__(None)
+        self.setWindowTitle("Rename Claude project")
+        self.result_pair = None
+        self.setStyleSheet("""
+            QDialog { background: #262524; }
+            QLabel { color: #d8d4cf; font-size: 13px; }
+            QLabel#err { color: #d84040; }
+            QLabel#hint { color: #96918b; font-size: 12px; }
+            QComboBox, QLineEdit { background: #33312f; color: #d8d4cf;
+                border: 1px solid #454240; border-radius: 6px; padding: 4px 8px; }
+            QComboBox QAbstractItemView {
+                background: #2b2a28; color: #d8d4cf;
+                border: 1px solid #454240;
+                selection-background-color: #D97757; selection-color: #1e1e1e;
+                outline: none; }
+            QPushButton { background: #33312f; color: #d8d4cf;
+                border: 1px solid #454240; border-radius: 8px; padding: 5px 14px; }
+            QPushButton:hover { background: #3d3a38; }
+        """)
+        v = QVBoxLayout(self)
+        v.setSpacing(8)
+        v.addWidget(QLabel("Rename a project folder and migrate its sessions\n"
+                           "and memory on both machines:"))
+        self.combo = QComboBox()
+        from PyQt6.QtWidgets import QListView
+        self.combo.setView(QListView())   # stylesheet applies reliably
+        self.combo.setMaxVisibleItems(18)
+        try:
+            folders = sorted((p.name for p in CLAUDE_ROOT.iterdir()
+                              if p.is_dir() and not p.name.startswith(".")),
+                             key=str.lower)
+        except OSError:
+            folders = []
+        self.combo.addItems(folders)
+        v.addWidget(self.combo)
+        self.edit = QLineEdit()
+        self.edit.setPlaceholderText("new name")
+        v.addWidget(self.edit)
+        hint = QLabel("Close any open Claude session in this project first.")
+        hint.setObjectName("hint")
+        v.addWidget(hint)
+        self.err = QLabel("")
+        self.err.setObjectName("err")
+        v.addWidget(self.err)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.validate_accept)
+        bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+
+    def validate_accept(self):
+        old = self.combo.currentText()
+        new = self.edit.text().strip()
+        if not old:
+            self.err.setText("no project selected")
+            return
+        if not new:
+            self.err.setText("enter a new name")
+            return
+        if "/" in new or new.startswith("."):
+            self.err.setText("invalid name")
+            return
+        if new == old:
+            self.err.setText("that's the same name")
+            return
+        if (CLAUDE_ROOT / new).exists():
+            self.err.setText(f"'{new}' already exists")
+            return
+        self.result_pair = (old, new)
+        self.accept()
+
+
+class StatusPopup(QWidget):
+    def __init__(self, app):
+        super().__init__(None, Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.Tool
+                         | Qt.WindowType.WindowStaysOnTopHint)
+        self.app_ref = app
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        card = QFrame()
+        card.setObjectName("card")
+        card.setStyleSheet("""
+            #card { background: #262524; border: 1px solid #3a3836;
+                    border-radius: 14px; }
+            QLabel { color: #d8d4cf; font-size: 13px; }
+            QLabel#title { color: #D97757; font-weight: 600; font-size: 14px; }
+            QPushButton { background: #33312f; color: #d8d4cf;
+                          border: 1px solid #454240; border-radius: 8px;
+                          padding: 5px 12px; font-size: 12px; }
+            QPushButton:hover { background: #3d3a38; }
+        """)
+        outer.addWidget(card)
+        v = QVBoxLayout(card)
+        v.setContentsMargins(16, 13, 16, 13)
+        v.setSpacing(7)
+        head = QHBoxLayout()
+        logo = QLabel()
+        lp = QPixmap(str(LOGO_PATH))
+        if not lp.isNull():
+            logo.setPixmap(lp.scaled(
+                22, 22, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation))
+        title = QLabel("Claude Sync")
+        title.setObjectName("title")
+        ver = QLabel(installed_version())
+        ver.setStyleSheet("color: #96918b; font-size: 11px;")
+        head.addWidget(logo)
+        head.addWidget(title)
+        head.addWidget(ver)
+        head.addStretch()
+        b_close = QPushButton("✕")
+        b_close.setFixedSize(24, 24)
+        b_close.setStyleSheet(
+            "QPushButton { border: none; background: transparent; color: #96918b;"
+            " font-size: 14px; padding: 0; }"
+            "QPushButton:hover { color: #d8d4cf; }")
+        b_close.clicked.connect(self.close_popup)
+        head.addWidget(b_close)
+        v.addLayout(head)
+        self.lines_box = QVBoxLayout()
+        self.lines_box.setSpacing(3)
+        v.addLayout(self.lines_box)
+        self.renames_box = QVBoxLayout()
+        self.renames_box.setSpacing(4)
+        v.addLayout(self.renames_box)
+        btns = QHBoxLayout()
+        b_sync = QPushButton("Sync now")
+        b_sync.clicked.connect(app.sync_now)
+        b_gui = QPushButton("Syncthing GUI")
+        b_gui.clicked.connect(lambda: subprocess.Popen(
+            ["xdg-open", "http://127.0.0.1:8384"]))
+        b_ren = QPushButton("Rename project…")
+        b_ren.clicked.connect(app.rename_project_flow)
+        self.b_update = QPushButton("Update now")
+        self.b_update.setStyleSheet(
+            "QPushButton { border-color: #D97757; color: #D97757; }")
+        self.b_update.clicked.connect(app.update_now)
+        self.b_update.setVisible(False)
+        btns.addWidget(self.b_update)
+        btns.addWidget(b_sync)
+        btns.addWidget(b_ren)
+        btns.addStretch()
+        v.addLayout(btns)
+        # second action row — everything the tray menu offers, in the popup
+        btns2 = QHBoxLayout()
+        b_term = QPushButton("Full status (terminal)")
+        b_term.clicked.connect(lambda: (self.close_popup(),
+                                        app.open_terminal_status()))
+        b_quit = QPushButton("Quit")
+        b_quit.clicked.connect(app.qapp.quit)
+        btns2.addWidget(b_gui)
+        btns2.addWidget(b_term)
+        btns2.addStretch()
+        btns2.addWidget(b_quit)
+        v.addLayout(btns2)
+
+    def close_popup(self):
+        self.hide()
+        self.app_ref.mark_popup_closed()
+
+    def set_lines(self, lines):
+        while self.lines_box.count():
+            item = self.lines_box.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for line in lines:
+            sym, _, rest = line.partition(" ")
+            c = LINE_COLORS.get(sym, "#d8d4cf")
+            lbl = QLabel(f'<span style="color:{c}">{sym}</span> {rest}')
+            lbl.setTextFormat(Qt.TextFormat.RichText)
+            self.lines_box.addWidget(lbl)
+
+    def set_renames(self, pairs):
+        while self.renames_box.count():
+            item = self.renames_box.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+            elif item.layout():
+                sub = item.layout()
+                while sub.count():
+                    si = sub.takeAt(0)
+                    if si.widget():
+                        si.widget().deleteLater()
+        for old, guess in pairs:
+            row = QHBoxLayout()
+            if guess:
+                lbl = QLabel(f'<span style="color:#e0a030">●</span> '
+                             f"renamed? <b>{old}</b> → <b>{guess}</b>")
+                lbl.setTextFormat(Qt.TextFormat.RichText)
+                btn = QPushButton("Repair")
+                btn.clicked.connect(
+                    lambda _, o=old, g=guess: self.app_ref.repair_rename(o, g))
+                row.addWidget(lbl)
+                row.addStretch()
+                row.addWidget(btn)
+            else:
+                lbl = QLabel(f'<span style="color:#e0a030">●</span> '
+                             f"<b>{old}</b> sessions orphaned — no matching "
+                             f"folder found (claude-mv-project {old} &lt;new&gt;)")
+                lbl.setTextFormat(Qt.TextFormat.RichText)
+                row.addWidget(lbl)
+            self.renames_box.addLayout(row)
+
+    def event(self, e):
+        if e.type() == QEvent.Type.WindowDeactivate:
+            self.hide()
+            self.app_ref.mark_popup_closed()
+        return super().event(e)
+
+
+class App:
+    def __init__(self, qapp: QApplication):
+        self.qapp = qapp
+        self.tray = None
+        self.popup = None
+        self._popup_closed_at = 0.0
+        self.bus = QDBusConnection.sessionBus()
+        self.watcher = QDBusServiceWatcher(
+            WATCHER, self.bus,
+            QDBusServiceWatcher.WatchModeFlag.WatchForOwnerChange)
+        self.watcher.serviceOwnerChanged.connect(self.on_owner_changed)
+
+        self.poll = QTimer()
+        self.poll.timeout.connect(self.try_create)
+        self.poll.start(2000)
+        self.try_create()
+
+        self.refresh_timer = QTimer()
+        self.refresh_timer.timeout.connect(self.refresh)
+        self.refresh_timer.start(60_000)
+
+    def watcher_present(self) -> bool:
+        iface = self.bus.interface()
+        return bool(iface and iface.isServiceRegistered(WATCHER).value())
+
+    def try_create(self):
+        if self.tray is None and self.watcher_present():
+            self.create_tray()
+        if self.tray is not None:
+            self.poll.stop()
+
+    def on_owner_changed(self, name, old, new):
+        # panel restarted: drop and recreate the icon
+        if self.tray is not None:
+            self.tray.hide()
+            self.tray.deleteLater()
+            self.tray = None
+        if new:
+            QTimer.singleShot(1500, self.try_create)
+        else:
+            self.poll.start(2000)
+
+    def create_tray(self):
+        self.tray = QSystemTrayIcon(make_icon("gray"))
+        menu = QMenu()
+        a_ver = QAction(f"Claude Sync {installed_version()}", menu)
+        a_ver.setEnabled(False)
+        menu.addAction(a_ver)
+        menu.addSeparator()
+        a_pop = QAction("Status popup", menu)
+        a_pop.triggered.connect(self.toggle_popup)
+        a_sync = QAction("Sync sessions now", menu)
+        a_sync.triggered.connect(self.sync_now)
+        a_gui = QAction("Open Syncthing GUI", menu)
+        a_gui.triggered.connect(lambda: subprocess.Popen(
+            ["xdg-open", "http://127.0.0.1:8384"]))
+        a_upd = QAction("Update Claude Sync", menu)
+        a_upd.triggered.connect(self.update_now)
+        a_term = QAction("Full status (terminal)", menu)
+        a_term.triggered.connect(self.open_terminal_status)
+        a_quit = QAction("Quit", menu)
+        a_quit.triggered.connect(self.qapp.quit)
+        for a in (a_pop, a_sync, a_gui, a_upd, a_term):
+            menu.addAction(a)
+        menu.addSeparator()
+        menu.addAction(a_quit)
+        self.menu = menu
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self.on_activated)
+        self.tray.show()
+        self.refresh()
+
+    def on_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.toggle_popup()
+
+    def mark_popup_closed(self):
+        self._popup_closed_at = time.monotonic()
+
+    def toggle_popup(self):
+        now = time.monotonic()
+        if self.popup is not None and self.popup.isVisible():
+            self.popup.hide()
+            self.mark_popup_closed()
+            return
+        # the click that dismissed the popup may also reach the tray icon;
+        # don't instantly reopen
+        if now - self._popup_closed_at < 0.4:
+            return
+        if self.popup is None:
+            self.popup = StatusPopup(self)
+        color, lines = check_status()
+        if self.tray is not None:
+            self.tray.setIcon(make_icon(color))
+            self.tray.setToolTip("Claude sync\n" + "\n".join(lines))
+        self.popup.set_lines(lines)
+        try:
+            self.popup.set_renames(detect_renames())
+        except Exception:
+            self.popup.set_renames([])
+        try:
+            upd = (Path.home() / ".local/share/claude-sync/.update-check").read_text().strip()
+        except OSError:
+            upd = "ok"
+        self.popup.b_update.setVisible(upd.startswith("pull") or upd == "reinstall")
+        self.popup.adjustSize()
+        # cursor coordinates are unreliable under Wayland/XWayland when the
+        # click lands on the native panel — anchor to the panel corner instead
+        geo = self.qapp.primaryScreen().availableGeometry()
+        self.popup.move(geo.right() - self.popup.width() - 12, geo.top() + 12)
+        self.popup.show()
+        self.popup.raise_()
+        self.popup.activateWindow()
+
+    def update_now(self):
+        def run():
+            r = subprocess.run(
+                [str(Path.home() / ".local/bin/claude-sync-check-update"), "--apply"],
+                capture_output=True, text=True, timeout=600)
+            ok = r.returncode == 0
+            subprocess.Popen(
+                ["notify-send", "-i", str(LOGO_PATH), "Claude Sync",
+                 r.stdout.strip()[-120:] if ok else
+                 f"update failed: {(r.stderr or r.stdout).strip()[-120:]}"])
+            if ok:
+                # binary on disk was replaced — re-exec ourselves onto it
+                os.execv(sys.executable,
+                         [sys.executable, str(Path.home() / ".local/bin/claude-sync-tray")])
+
+        import threading
+        threading.Thread(target=run, daemon=True).start()
+
+    def open_terminal_status(self):
+        subprocess.Popen(["cosmic-term", "-e",
+                          str(Path.home() / ".local/bin/claude-sync-status"),
+                          "--wait"])
+
+    def rename_project_flow(self):
+        if self.popup is not None:
+            self.popup.hide()
+            self.mark_popup_closed()
+        dlg = RenameDialog()
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.result_pair:
+            self.repair_rename(*dlg.result_pair)
+
+    def repair_rename(self, old, new):
+        if self.popup is not None:
+            self.popup.hide()
+            self.mark_popup_closed()
+
+        def run():
+            r = subprocess.run(
+                [str(Path.home() / ".local/bin/claude-mv-project"), old, new],
+                capture_output=True, text=True, timeout=300)
+            ok = r.returncode == 0
+            subprocess.Popen(
+                ["notify-send", "-i", str(LOGO_PATH), "Claude Sync",
+                 (f"Repaired: {old} → {new}" if ok else
+                  f"Repair FAILED for {old} → {new}\n{r.stderr.strip()[-200:]}")])
+
+        import threading
+        threading.Thread(target=run, daemon=True).start()
+        QTimer.singleShot(10_000, self.refresh)
+
+    def sync_now(self):
+        subprocess.Popen([str(Path.home() / ".local/bin/claude-session-translate")],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        QTimer.singleShot(5000, self.refresh)
+
+    def refresh(self):
+        if self.tray is None:
+            return
+        try:
+            color, lines = check_status()
+        except Exception as e:
+            color, lines = "gray", [f"? status check failed: {e}"]
+        self.tray.setIcon(make_icon(color))
+        self.tray.setToolTip("Claude sync\n" + "\n".join(lines))
+        if self.popup is not None and self.popup.isVisible():
+            self.popup.set_lines(lines)
+        # notify once when an update first becomes available (check_status
+        # already triggered the cached checker)
+        try:
+            upd = (Path.home() / ".local/share/claude-sync/.update-check").read_text().strip()
+        except OSError:
+            upd = "ok"
+        actionable = upd.startswith("pull") or upd == "reinstall"
+        if actionable and getattr(self, "_last_upd", "ok") != upd:
+            subprocess.Popen(
+                ["notify-send", "-i", str(LOGO_PATH), "Claude Sync",
+                 "Update available — open the popup and hit “Update now”"])
+        self._last_upd = upd
+
+
+def main():
+    if len(sys.argv) >= 4 and sys.argv[1] == "--render-icon":
+        os.environ["QT_QPA_PLATFORM"] = "offscreen"
+        qapp = QApplication(sys.argv)
+        size, out = int(sys.argv[2]), sys.argv[3]
+        make_pixmap(None, size).save(out, "PNG")
+        print(f"wrote {out}")
+        return
+    if len(sys.argv) >= 5 and sys.argv[1] == "--render-badge":
+        os.environ["QT_QPA_PLATFORM"] = "offscreen"
+        qapp = QApplication(sys.argv)
+        state, size, out = sys.argv[2], int(sys.argv[3]), sys.argv[4]
+        make_pixmap(state, size).save(out, "PNG")
+        print(f"wrote {out}")
+        return
+
+    # xcb (XWayland) so the popup can be cursor-positioned and focused;
+    # the tray icon itself is D-Bus and works the same either way
+    os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+    qapp = QApplication(sys.argv)
+    qapp.setQuitOnLastWindowClosed(False)
+    app = App(qapp)          # keep a reference or Python GCs the tray
+    sys.exit(qapp.exec())
+
+
+if __name__ == "__main__":
+    main()

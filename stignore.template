@@ -1,0 +1,20 @@
+// build artifacts & dependencies — regenerable, machine-specific
+node_modules
+target
+dist
+build
+.next
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.cache
+.gradle
+// OS noise
+(?d).DS_Store
+(?d)._*
+(?d)Thumbs.db
+// syncthing internals
+(?d).stfolder

@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# One-shot health check for the claude-sync stack (run on the hub):
+#   1. session/memory/skills sync (SSH translator, claude-session-sync.timer)
+#   2. projects-root mirror (Syncthing), per peer
+#   3. orphaned session stores (renamed project folders)
+set -uo pipefail
+
+CFG="${CLAUDE_SYNC_CONFIG:-$HOME/.config/claude-sync/config}"
+# shellcheck disable=SC1090
+[[ -f "$CFG" ]] && source "$CFG"
+ROOT="${LOCAL_ROOT:-$HOME/Claude}"
+FOLDER="${ST_FOLDER_ID:-claude-projects}"
+PEER_LIST="${PEERS:-}"
+
+B=$(tput bold 2>/dev/null||true); R=$(tput sgr0 2>/dev/null||true)
+GRN=$(tput setaf 2 2>/dev/null||true); RED=$(tput setaf 1 2>/dev/null||true); YLW=$(tput setaf 3 2>/dev/null||true)
+ok()   { echo "  ${GRN}●${R} $*"; }
+warn() { echo "  ${YLW}●${R} $*"; }
+bad()  { echo "  ${RED}●${R} $*"; }
+
+[[ "${1:-}" == "--wait" ]] && trap 'echo; read -n1 -s -r -p "— press any key to close —"' EXIT
+
+echo "${B}── Devices (translate heartbeats via staging) ${R}"
+STAGE="${CST_STAGE:-$HOME/.claude/sync-staging}"
+found=0
+for hb in "$STAGE"/_control/heartbeat-*; do
+  [[ -f "$hb" ]] || continue
+  found=1
+  host="${hb##*/heartbeat-}"
+  age=$(( ($(date +%s) - $(cat "$hb")) / 60 ))
+  if (( age < 15 )); then
+    ok "$host: translated ${age} min ago"
+  elif (( age < 1440 )); then
+    warn "$host: last translate ${age} min ago (asleep? catches up via relay)"
+  else
+    warn "$host: last translate $((age / 1440)) day(s) ago"
+  fi
+done
+[[ "$found" == 0 ]] && warn "no heartbeats yet — first translator run pending"
+
+upd=$("$HOME/.local/bin/claude-sync-check-update" 2>/dev/null || echo unknown)
+case "$upd" in
+  pull:*) warn "update available (${upd#pull:} new commits) — apply: claude-sync-check-update --apply" ;;
+  reinstall) warn "new version synced — apply: claude-sync-check-update --apply" ;;
+esac
+
+echo "${B}── Sessions · memory · skills (every 2 min) ─${R}"
+if [[ "$(systemctl --user is-active claude-session-sync.timer)" == active ]]; then
+  ok "timer active — next: $(systemctl --user list-timers claude-session-sync.timer --no-pager 2>/dev/null | awk 'NR==2{print $1" "$2" ("$3" "$4")"}')"
+else
+  bad "timer NOT active — run: systemctl --user restart claude-session-sync.timer"
+fi
+last=$(journalctl --user -u claude-session-sync.service --since "2 days ago" --no-pager 2>/dev/null | grep "pulled" | tail -1)
+if [[ -n "$last" ]]; then
+  ok "last transfer: $(echo "$last" | sed 's/.* claude-session-sync\[[0-9]*\]:/ →/')"
+  echo "    recent:"
+  journalctl --user -u claude-session-sync.service --since "1 hour ago" --no-pager 2>/dev/null \
+    | grep "pulled" | tail -3 | sed 's/ [^ ]* claude-session-sync\[[0-9]*\]:/ →/;s/^/      /'
+else
+  warn "no transfers logged in 2 days (peers away the whole time?)"
+fi
+
+echo "${B}── Projects mirror (Syncthing) ──────────────${R}"
+if [[ "$(systemctl --user is-active syncthing.service)" == active ]]; then
+  cfgx=$(ls ~/.local/state/syncthing/config.xml ~/.config/syncthing/config.xml 2>/dev/null | head -1)
+  key=$(sed -n 's/.*<apikey>\(.*\)<\/apikey>.*/\1/p' "$cfgx" 2>/dev/null | head -1)
+  api() { curl -s -m 5 -H "X-API-Key: $key" "http://127.0.0.1:8384/rest/$1"; }
+  api "db/completion?folder=$FOLDER" | python3 -c "
+import json,sys; d=json.load(sys.stdin)
+print(f\"  {'●' if d['completion']>=100 else '◐'} this machine has {d['completion']:.1f}% ({round(d['needBytes']/1e6)} MB missing)\")" 2>/dev/null \
+    || warn "Syncthing API not answering"
+  for PEER in $PEER_LIST; do
+    dv="PEER_DEVICE_$PEER"; DID="${!dv:-}"
+    [[ -n "$DID" ]] || continue
+    conn=$(api "system/connections" | python3 -c "import json,sys; print(json.load(sys.stdin)['connections'].get('$DID',{}).get('connected',False))" 2>/dev/null)
+    [[ "$conn" == True ]] && ok "$PEER: syncthing connected" || warn "$PEER: syncthing not connected right now"
+    api "db/completion?folder=$FOLDER&device=$DID" | python3 -c "
+import json,sys; d=json.load(sys.stdin)
+print(f\"  {'●' if d['completion']>=100 else '◐'} $PEER has {d['completion']:.1f}% ({round(d['needBytes']/1e6)} MB missing)\")" 2>/dev/null
+  done
+  declare -A seen_tops
+  orphaned=0
+  for d in "$HOME/.claude/projects/$(printf '%s' "$ROOT" | sed 's/[^A-Za-z0-9]/-/g')"*/; do
+    [[ -d "$d" ]] || continue
+    f=$(find "$d" -maxdepth 1 -name '*.jsonl' 2>/dev/null | head -1)
+    [[ -n "$f" ]] || continue
+    cwd=$(grep -m1 -o '"cwd":"[^"]*"' "$f" | head -1 | cut -d'"' -f4)
+    [[ "$cwd" == "$ROOT/"* ]] || continue
+    top="${cwd#"$ROOT"/}"; top="${top%%/*}"
+    [[ -n "${seen_tops[$top]:-}" ]] && continue
+    seen_tops[$top]=1
+    if [[ ! -e "$ROOT/$top" ]]; then
+      warn "'$top' sessions orphaned (folder renamed?) — fix: claude-mv-project '$top' <new-name>"
+      orphaned=1
+    fi
+  done
+  [[ "$orphaned" == 0 ]] && ok "no orphaned session stores (renames all clean)"
+  nconf=$(find "$ROOT" -name '*.sync-conflict-*' -not -path '*/.stversions/*' 2>/dev/null | wc -l)
+  if [[ "$nconf" -gt 0 ]]; then
+    warn "$nconf conflict file(s) — list: find $ROOT -name '*.sync-conflict-*'"
+  else
+    ok "no conflict files"
+  fi
+else
+  bad "syncthing.service NOT active — run: systemctl --user restart syncthing"
+fi

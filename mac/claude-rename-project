@@ -1,0 +1,49 @@
+#!/bin/bash
+# claude-rename-project (macOS peer) — proactive project rename with native
+# dialogs, invoked from the SwiftBar menu. Renames <root>/<old> and migrates
+# this Mac's session store immediately; queues the hub-side migration in
+# ~/.claude/.pending-renames, which the hub's sync timer applies within ~2 min.
+set -uo pipefail
+
+CONF="$HOME/.config/claude-sync/config"
+[ -f "$CONF" ] && . "$CONF"
+ROOT="${LOCAL_ROOT:-$HOME/Claude}"
+
+folders="$(cd "$ROOT" 2>/dev/null && find . -maxdepth 1 -mindepth 1 -type d ! -name '.*' | sed 's|^\./||' | sort -f)"
+[ -n "$folders" ] || exit 0
+
+# bash 3.2 can't parse heredocs inside $(...): stage the AppleScript in a file
+scpt="$(mktemp /tmp/claude-rename.XXXXXX)"
+cat > "$scpt" <<'AS'
+on run argv
+    set AppleScript's text item delimiters to linefeed
+    set fl to text items of (item 1 of argv)
+    set c to choose from list fl with prompt "Rename which Claude project?" with title "Claude Sync"
+    if c is false then return ""
+    set old to item 1 of c
+    set d to display dialog ("New name for \"" & old & "\":" & return & "(close any open Claude session in it first)") default answer old with title "Claude Sync"
+    return old & "|" & text returned of d
+end run
+AS
+res="$(osascript "$scpt" "$folders")"
+rm -f "$scpt"
+[ -n "$res" ] || exit 0
+
+old="${res%%|*}"
+new="${res#*|}"
+new="$(printf '%s' "$new" | sed 's/^ *//;s/ *$//')"
+
+fail() {
+  osascript -e "display alert \"Claude Sync\" message \"$1\" as critical" >/dev/null 2>&1
+  exit 1
+}
+[ -n "$new" ] || fail "New name is empty."
+[ "$new" != "$old" ] || fail "That's the same name."
+case "$new" in */*|.*) fail "Invalid name." ;; esac
+[ ! -e "$ROOT/$new" ] || fail "'$new' already exists."
+
+# mv-project migrates the local store and queues other devices via staging
+out="$(CMP_ROOT="$ROOT" CMP_BASE="$ROOT" "$HOME/.local/bin/claude-mv-project" "$old" "$new" 2>&1)" || fail "Rename failed: $out"
+
+osascript -e "display notification \"$old → $new — other machines follow within ~2 min\" with title \"Claude Sync\" subtitle \"Project renamed\"" >/dev/null 2>&1
+exit 0

@@ -1,0 +1,163 @@
+#!/bin/bash
+# claude-session-translate — v3 session sync. Runs LOCALLY on every device
+# (bash 3.2 compatible: no associative arrays, no flock, GNU/BSD stat probe).
+#
+# Mirrors the live Claude Code session store into a canonical staging folder
+# that Syncthing carries between devices (via an always-on relay like a NAS):
+#
+#   live  ~/.claude/projects/<encoded-abs-path>/…   machine-specific paths
+#   stage ~/.claude/sync-staging/R-<name>/…         __CLAUDE_ROOT__ placeholders
+#                              /H-<name>/…          __CLAUDE_HOME__ (outside root)
+#                              /_user/{skills,agents,commands}
+#                              /_control/heartbeat-<host>, renames-<host>
+#
+# Newest-wins per file, mtimes preserved (idempotent), never deletes.
+# Applies rename queues from other hosts (claude-mv-project --store-only).
+set -uo pipefail
+
+CFG="${CLAUDE_SYNC_CONFIG:-$HOME/.config/claude-sync/config}"
+# shellcheck disable=SC1090
+[ -f "$CFG" ] && . "$CFG"
+LIVE="${CST_LIVE:-$HOME/.claude/projects}"
+STAGE="${CST_STAGE:-$HOME/.claude/sync-staging}"
+ROOT="${LOCAL_ROOT:-$HOME/Claude}"
+HOMEDIR="${LOCAL_HOME:-$HOME}"
+MAX_AGE_DAYS="${MAX_AGE_DAYS:-45}"
+HOSTTAG="${CST_HOST:-$(hostname -s | tr -c 'A-Za-z0-9' '-' | sed 's/-*$//')}"
+USERDIRS="skills agents commands"
+
+# --- portability probes -------------------------------------------------------
+if stat -c %Y / >/dev/null 2>&1; then
+  mtime_of() { stat -c %Y "$1"; }
+else
+  mtime_of() { stat -f %m "$1"; }
+fi
+
+# single-instance lock (mkdir is atomic everywhere; stale after 10 min)
+LOCK="$HOME/.claude/.session-translate.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then
+    rmdir "$LOCK" 2>/dev/null; mkdir "$LOCK" 2>/dev/null || exit 0
+  else
+    exit 0
+  fi
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
+encode() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'; }
+ENC_ROOT="$(encode "$ROOT")"
+ENC_HOME="$(encode "$HOMEDIR")"
+
+mkdir -p "$STAGE/_user" "$STAGE/_control" "$LIVE"
+
+# live top-dir name -> canonical (empty output = not ours to sync)
+to_canon() {
+  case "$1" in
+    "$ENC_ROOT")    echo "R" ;;
+    "$ENC_ROOT"-*)  echo "R-${1#"$ENC_ROOT"-}" ;;
+    "$ENC_HOME")    echo "H" ;;
+    "$ENC_HOME"-*)  echo "H-${1#"$ENC_HOME"-}" ;;
+    *)              echo "" ;;
+  esac
+}
+# canonical top-dir name -> live
+to_live() {
+  case "$1" in
+    R)    echo "$ENC_ROOT" ;;
+    R-*)  echo "$ENC_ROOT-${1#R-}" ;;
+    H)    echo "$ENC_HOME" ;;
+    H-*)  echo "$ENC_HOME-${1#H-}" ;;
+    *)    echo "" ;;
+  esac
+}
+
+# copy src -> dst with sed translation if src is newer; preserve mtime
+xfer() { # src dst sed1a sed1b sed2a sed2b
+  local src="$1" dst="$2"
+  [ -f "$dst" ] && [ ! "$src" -nt "$dst" ] && return 1
+  mkdir -p "$(dirname -- "$dst")"
+  local tmp
+  tmp="$(mktemp "$(dirname -- "$dst")/.sync.XXXXXX")" || return 1
+  sed -e "s|$3|$4|g" -e "s|$5|$6|g" "$src" > "$tmp"
+  touch -r "$src" "$tmp"
+  mv -f "$tmp" "$dst"
+  return 0
+}
+
+pushed=0 pulled=0
+
+# --- export: live -> staging --------------------------------------------------
+while IFS= read -r -d '' f; do
+  rel="${f#"$LIVE"/}"
+  top="${rel%%/*}"; rest="${rel#*/}"
+  [ "$top" = "$rel" ] && continue
+  canon="$(to_canon "$top")"
+  [ -n "$canon" ] || continue
+  if xfer "$f" "$STAGE/$canon/$rest" "$ROOT" "__CLAUDE_ROOT__" "$HOMEDIR" "__CLAUDE_HOME__"; then
+    pushed=$((pushed+1))
+  fi
+done < <(find "$LIVE" -type f \( -path '*/memory/*' -o -mtime "-$MAX_AGE_DAYS" \) \
+           ! -name '.sync.*' ! -name '._*' ! -name '.DS_Store' ! -name '*.sync-conflict-*' -print0)
+
+# --- import: staging -> live ----------------------------------------------------
+while IFS= read -r -d '' f; do
+  rel="${f#"$STAGE"/}"
+  top="${rel%%/*}"; rest="${rel#*/}"
+  [ "$top" = "$rel" ] && continue
+  case "$top" in _user|_control) continue ;; esac
+  live_top="$(to_live "$top")"
+  [ -n "$live_top" ] || continue
+  if xfer "$f" "$LIVE/$live_top/$rest" "__CLAUDE_ROOT__" "$ROOT" "__CLAUDE_HOME__" "$HOMEDIR"; then
+    pulled=$((pulled+1))
+  fi
+done < <(find "$STAGE" -type f \( -path '*/memory/*' -o -mtime "-$MAX_AGE_DAYS" \) \
+           ! -name '.sync.*' ! -name '._*' ! -name '.DS_Store' ! -name '*.sync-conflict-*' -print0)
+
+# --- user-level skills/agents/commands (no translation, newest-wins) ------------
+for d in $USERDIRS; do
+  mkdir -p "$HOME/.claude/$d" "$STAGE/_user/$d"
+  while IFS= read -r -d '' f; do
+    rel="${f#"$HOME/.claude/$d"/}"
+    dst="$STAGE/_user/$d/$rel"
+    if [ ! -f "$dst" ] || [ "$f" -nt "$dst" ]; then
+      mkdir -p "$(dirname -- "$dst")"; cp -p "$f" "$dst"; pushed=$((pushed+1))
+    fi
+  done < <(find "$HOME/.claude/$d" -type f ! -name '.sync.*' ! -name '._*' ! -name '.DS_Store' ! -name '*.sync-conflict-*' -print0)
+  while IFS= read -r -d '' f; do
+    rel="${f#"$STAGE/_user/$d"/}"
+    dst="$HOME/.claude/$d/$rel"
+    if [ ! -f "$dst" ] || [ "$f" -nt "$dst" ]; then
+      mkdir -p "$(dirname -- "$dst")"; cp -p "$f" "$dst"; pulled=$((pulled+1))
+    fi
+  done < <(find "$STAGE/_user/$d" -type f ! -name '.sync.*' ! -name '._*' ! -name '.DS_Store' ! -name '*.sync-conflict-*' -print0)
+done
+
+# --- apply rename queues from other hosts ---------------------------------------
+APPLIED="$HOME/.local/share/claude-sync/applied-renames"
+mkdir -p "$(dirname "$APPLIED")"; touch "$APPLIED"
+for qf in "$STAGE/_control"/renames-*; do
+  [ -f "$qf" ] || continue
+  qhost="${qf##*/renames-}"
+  [ "$qhost" = "$HOSTTAG" ] && continue
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    grep -qxF "$line" "$APPLIED" && continue
+    old="$(printf '%s' "$line" | cut -d'|' -f3)"
+    new="$(printf '%s' "$line" | cut -d'|' -f4)"
+    if [ -n "$old" ] && [ -n "$new" ]; then
+      if "$HOME/.local/bin/claude-mv-project" --store-only "$old" "$new" >/dev/null 2>&1; then
+        echo "applied rename from $qhost: $old -> $new"
+        command -v notify-send >/dev/null && notify-send -i "$HOME/.local/share/claude-sync/claude-logo.png" \
+          "Claude Sync" "Applied rename from $qhost: $old → $new" 2>/dev/null
+      fi
+    fi
+    echo "$line" >> "$APPLIED"
+  done < "$qf"
+done
+
+date +%s > "$STAGE/_control/heartbeat-$HOSTTAG"
+date +%s > "$HOME/.claude/.claude-sync-heartbeat"
+# keep the update-check cache warm (30-min self-throttled) so indicators —
+# and headless devices — always know about new versions
+"$HOME/.local/bin/claude-sync-check-update" >/dev/null 2>&1 || true
+echo "pulled $pulled, pushed $pushed"
