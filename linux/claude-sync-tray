@@ -15,6 +15,7 @@ take focus; the tray itself is D-Bus (SNI) and doesn't care.
 """
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -52,16 +53,24 @@ PEERS = CONF.get("PEERS", "").split()
 PEER_DEVICES = {p: CONF.get(f"PEER_DEVICE_{p}", "") for p in PEERS}
 
 
+def tool(name):
+    return shutil.which(name) or str(Path.home() / ".local/bin" / name)
+
+
 def installed_version():
     base = Path.home() / ".local/share/claude-sync"
+    rel = h = ""
     try:
         rel = (base / "installed-release").read_text().strip()
     except OSError:
-        rel = ""
+        try:  # system-wide (.deb) install
+            rel = Path("/usr/share/claude-sync/VERSION").read_text().strip()
+        except OSError:
+            pass
     try:
         h = (base / "installed-version").read_text().strip()[:7]
     except OSError:
-        h = ""
+        pass
     return f"v{rel}" + (f" ({h})" if h else "") if rel else (h or "dev")
 COLORS = {"green": "#4caf50", "blue": "#4a90d9", "amber": "#e0a030",
           "red": "#d84040", "gray": "#909090"}
@@ -263,7 +272,7 @@ def check_status():
         pass
 
     upd = subprocess.run(
-        [str(Path.home() / ".local/bin/claude-sync-check-update")],
+        [tool("claude-sync-check-update")],
         capture_output=True, text=True).stdout.strip()
     if upd.startswith("pull:"):
         lines.append(f"● update available ({upd[5:]} new commits) — menu → Update")
@@ -606,7 +615,7 @@ class App:
     def update_now(self):
         def run():
             r = subprocess.run(
-                [str(Path.home() / ".local/bin/claude-sync-check-update"), "--apply"],
+                [tool("claude-sync-check-update"), "--apply"],
                 capture_output=True, text=True, timeout=600)
             ok = r.returncode == 0
             subprocess.Popen(
@@ -616,14 +625,14 @@ class App:
             if ok:
                 # binary on disk was replaced — re-exec ourselves onto it
                 os.execv(sys.executable,
-                         [sys.executable, str(Path.home() / ".local/bin/claude-sync-tray")])
+                         [sys.executable, tool("claude-sync-tray")])
 
         import threading
         threading.Thread(target=run, daemon=True).start()
 
     def open_terminal_status(self):
         subprocess.Popen(["cosmic-term", "-e",
-                          str(Path.home() / ".local/bin/claude-sync-status"),
+                          tool("claude-sync-status"),
                           "--wait"])
 
     def rename_project_flow(self):
@@ -641,7 +650,7 @@ class App:
 
         def run():
             r = subprocess.run(
-                [str(Path.home() / ".local/bin/claude-mv-project"), old, new],
+                [tool("claude-mv-project"), old, new],
                 capture_output=True, text=True, timeout=300)
             ok = r.returncode == 0
             subprocess.Popen(
@@ -654,7 +663,7 @@ class App:
         QTimer.singleShot(10_000, self.refresh)
 
     def sync_now(self):
-        subprocess.Popen([str(Path.home() / ".local/bin/claude-session-translate")],
+        subprocess.Popen([tool("claude-session-translate")],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         QTimer.singleShot(5000, self.refresh)
 

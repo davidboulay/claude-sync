@@ -15,6 +15,7 @@
 # Applies rename queues from other hosts (claude-mv-project --store-only).
 set -uo pipefail
 
+csbin() { command -v "$1" 2>/dev/null || echo "$HOME/.local/bin/$1"; }
 CFG="${CLAUDE_SYNC_CONFIG:-$HOME/.config/claude-sync/config}"
 # shellcheck disable=SC1090
 [ -f "$CFG" ] && . "$CFG"
@@ -145,7 +146,7 @@ for qf in "$STAGE/_control"/renames-*; do
     old="$(printf '%s' "$line" | cut -d'|' -f3)"
     new="$(printf '%s' "$line" | cut -d'|' -f4)"
     if [ -n "$old" ] && [ -n "$new" ]; then
-      if "$HOME/.local/bin/claude-mv-project" --store-only "$old" "$new" >/dev/null 2>&1; then
+      if "$(csbin claude-mv-project)" --store-only "$old" "$new" >/dev/null 2>&1; then
         echo "applied rename from $qhost: $old -> $new"
         command -v notify-send >/dev/null && notify-send -i "$HOME/.local/share/claude-sync/claude-logo.png" \
           "Claude Sync" "Applied rename from $qhost: $old → $new" 2>/dev/null
@@ -159,5 +160,5 @@ date +%s > "$STAGE/_control/heartbeat-$HOSTTAG"
 date +%s > "$HOME/.claude/.claude-sync-heartbeat"
 # keep the update-check cache warm (30-min self-throttled) so indicators —
 # and headless devices — always know about new versions
-"$HOME/.local/bin/claude-sync-check-update" >/dev/null 2>&1 || true
+"$(csbin claude-sync-check-update)" >/dev/null 2>&1 || true
 echo "pulled $pulled, pushed $pushed"

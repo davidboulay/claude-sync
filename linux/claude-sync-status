@@ -5,6 +5,7 @@
 #   3. orphaned session stores (renamed project folders)
 set -uo pipefail
 
+csbin() { command -v "$1" 2>/dev/null || echo "$HOME/.local/bin/$1"; }
 CFG="${CLAUDE_SYNC_CONFIG:-$HOME/.config/claude-sync/config}"
 # shellcheck disable=SC1090
 [[ -f "$CFG" ]] && source "$CFG"
@@ -38,7 +39,7 @@ for hb in "$STAGE"/_control/heartbeat-*; do
 done
 [[ "$found" == 0 ]] && warn "no heartbeats yet — first translator run pending"
 
-upd=$("$HOME/.local/bin/claude-sync-check-update" 2>/dev/null || echo unknown)
+upd=$("$(csbin claude-sync-check-update)" 2>/dev/null || echo unknown)
 case "$upd" in
   pull:*) warn "update available (${upd#pull:} new commits) — apply: claude-sync-check-update --apply" ;;
   reinstall) warn "new version synced — apply: claude-sync-check-update --apply" ;;

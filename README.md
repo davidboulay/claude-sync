@@ -4,9 +4,11 @@
 
 > Not affiliated with Anthropic; the Claude Code mark is fetched at install time from [LobeHub icons](https://lobehub.com/icons/claudecode), not committed here. Nothing is hardcoded — a setup wizard generates a config per machine (`~/.config/claude-sync/config`) with your paths, peers and device IDs.
 
-| Linux (tray popup) | macOS (native menu-bar app) |
-|---|---|
-| ![Linux tray popup — version, health lines, and actions: Sync now, Rename project, Syncthing GUI, terminal status, Quit](docs/screenshots/linux-popup.png) | ![macOS menu-bar app — version header, health lines, and actions including Rename project and Check for updates](docs/screenshots/mac-menubar.png) |
+<p align="center">
+  <img src="docs/screenshots/linux-popup.png" height="290" alt="Linux tray popup — version, health lines, and actions: Sync now, Rename project, Syncthing GUI, terminal status, Quit">
+  &nbsp;&nbsp;
+  <img src="docs/screenshots/mac-menubar.png" height="290" alt="macOS menu-bar app — version header, health lines, and actions including Rename project and Check for updates">
+</p>
 
 ## The problem
 
