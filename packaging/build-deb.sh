@@ -30,8 +30,7 @@ sed 's|__HOME__/.local/bin/claude-sync-tray|/usr/bin/claude-sync-tray|' \
   "$REPO/linux/desktop/claude-sync-tray.desktop" > "$PKG/etc/xdg/autostart/claude-sync-tray.desktop"
 
 cp "$REPO/stignore.template" "$REPO/VERSION" "$PKG/usr/share/claude-sync/"
-cp "$REPO/mac/claude-sync.60s.sh" "$REPO/mac/claude-rename-project" \
-   "$REPO/mac/claude-sync-translate.plist" "$PKG/usr/share/claude-sync/peer-files/"
+cp "$REPO/mac/claude-sync.60s.sh" "$REPO/mac/claude-rename-project" "$PKG/usr/share/claude-sync/peer-files/"
 cp "$REPO/README.md" "$PKG/usr/share/doc/claude-sync/"
 cp "$REPO/LICENSE" "$PKG/usr/share/doc/claude-sync/copyright"
 

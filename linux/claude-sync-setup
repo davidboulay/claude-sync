@@ -7,14 +7,11 @@
 #   3. detect the peer's OS, home and projects root
 #   4. ensure Syncthing on the peer (brew cask / DMG on macOS, static binary
 #      + systemd unit on Linux — skipped if already installed)
-#   5. pair the two Syncthing instances and share BOTH folders (projects +
-#      canonical session staging), all via the REST API
-#   6. deploy the peer-side tools, config and translate timer/agent
+#   5. pair the two Syncthing instances and share the projects folder
+#      (ignore patterns + 30-day trash can), all via the REST API
+#   6. deploy the peer-side tools and config, start the sync timer
 #
-# `claude-sync-setup relay` adds an always-on Syncthing-only device (NAS,
-# Pi, server) — no SSH and no claude-sync code needed on it.
-#
-# Rerun anytime to add another device or repair a step — every step is
+# Rerun anytime to add another peer or repair a step — every step is
 # check-first and skips what already exists.
 set -uo pipefail
 
@@ -24,7 +21,6 @@ share_path() { for d in "$HOME/.local/share/claude-sync" /usr/share/claude-sync;
 CFG="$CFG_DIR/config"
 SHARE="$HOME/.local/share/claude-sync"
 FOLDER_ID="claude-projects"
-SESS_ID="claude-sessions"
 
 say()  { printf '\033[1m== %s\033[0m\n' "$*"; }
 ok()   { printf '   \033[32m✓\033[0m %s\n' "$*"; }
@@ -81,79 +77,6 @@ lapi() { curl -s -m 10 -H "X-API-Key: $LKEY" "http://127.0.0.1:8384/rest/$1" "${
 LOCAL_ID=$(lapi system/status | python3 -c 'import json,sys; print(json.load(sys.stdin)["myID"])')
 ok "local syncthing device: ${LOCAL_ID:0:7}…"
 loginctl enable-linger "$USER" 2>/dev/null || true
-
-# ---------- relay mode: always-on Syncthing-only device (NAS, Pi, server) -----
-# `claude-sync-setup relay` — the relay needs NO claude-sync code, only
-# Syncthing. It stores the canonical data and bridges devices that are never
-# awake at the same time.
-if [[ "${1:-}" == "relay" ]]; then
-  say "relay device"
-  RNAME="$(ask "Short name for the relay (letters/digits/_ only)" "nas")"
-  [[ "$RNAME" =~ ^[A-Za-z0-9_]+$ ]] || die "name must be letters/digits/underscore"
-  RID="$(ask "Relay's Syncthing device ID (its GUI → Actions → Show ID)" "")"
-  [[ "$RID" =~ ^[A-Z0-9]{7}(-[A-Z0-9]{7}){7}$ ]] || die "that doesn't look like a Syncthing device ID"
-  RGUI="$(ask "Relay GUI URL for full automation, e.g. http://nas:8384 (blank = accept shares in its GUI)" "")"
-
-  lapi "config/devices/$RID" -X PUT -H "Content-Type: application/json" \
-    -d "{\"deviceID\":\"$RID\",\"name\":\"$RNAME\"}" >/dev/null
-  mkdir -p "$HOME/.claude/sync-staging"
-  # merge the relay into both local folders (create them if this is the first device)
-  for fid in "$FOLDER_ID:$LOCAL_ROOT:Claude projects" "$SESS_ID:$HOME/.claude/sync-staging:Claude sessions"; do
-    id="${fid%%:*}"; rest="${fid#*:}"; path="${rest%%:*}"; label="${rest#*:}"
-    cur="$(lapi "config/folders/$id")"
-    if echo "$cur" | grep -q '"deviceID"'; then
-      echo "$cur" | python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-ids={x['deviceID'] for x in d['devices']}; ids.add('$RID')
-d['devices']=[{'deviceID':i} for i in sorted(ids)]
-print(json.dumps(d))" | lapi "config/folders/$id" -X PUT -H "Content-Type: application/json" -d @- >/dev/null
-    else
-      lapi "config/folders/$id" -X PUT -H "Content-Type: application/json" \
-        -d "{\"id\":\"$id\",\"label\":\"$label\",\"path\":\"$path\",\"devices\":[{\"deviceID\":\"$LOCAL_ID\"},{\"deviceID\":\"$RID\"}],\"versioning\":{\"type\":\"trashcan\",\"params\":{\"cleanoutDays\":\"30\"}}}" >/dev/null
-    fi
-  done
-  ok "relay registered locally and offered both folders"
-
-  if [[ -n "$RGUI" ]]; then
-    RKEY="$(ask "Relay Syncthing API key (its GUI → Actions → Settings)" "")"
-    rapi() { curl -s -m 10 -H "X-API-Key: $RKEY" "$RGUI/rest/$1" "${@:2}"; }
-    rapi system/ping | grep -q pong || die "cannot reach relay API at $RGUI"
-    RPPATH="$(ask "Path ON THE RELAY for the projects folder" "/data/claude/projects")"
-    RSPATH="$(ask "Path ON THE RELAY for the sessions folder" "/data/claude/sessions")"
-    rapi "config/devices/$LOCAL_ID" -X PUT -H "Content-Type: application/json" \
-      -d "{\"deviceID\":\"$LOCAL_ID\",\"name\":\"$(hostname -s)\"}" >/dev/null
-    rdevs="\"devices\":[{\"deviceID\":\"$LOCAL_ID\"},{\"deviceID\":\"$RID\"}"
-    for p in ${PEERS:-}; do
-      v="PEER_DEVICE_$p"
-      if [[ -n "${!v:-}" && "${!v}" != "$RID" ]]; then
-        rapi "config/devices/${!v}" -X PUT -H "Content-Type: application/json" \
-          -d "{\"deviceID\":\"${!v}\",\"name\":\"$p\"}" >/dev/null
-        rdevs+=",{\"deviceID\":\"${!v}\"}"
-      fi
-    done
-    rdevs+="]"
-    rapi "config/folders/$FOLDER_ID" -X PUT -H "Content-Type: application/json" \
-      -d "{\"id\":\"$FOLDER_ID\",\"label\":\"Claude projects\",\"path\":\"$RPPATH\",$rdevs,\"versioning\":{\"type\":\"trashcan\",\"params\":{\"cleanoutDays\":\"30\"}}}" >/dev/null
-    rapi "config/folders/$SESS_ID" -X PUT -H "Content-Type: application/json" \
-      -d "{\"id\":\"$SESS_ID\",\"label\":\"Claude sessions\",\"path\":\"$RSPATH\",$rdevs,\"fsWatcherDelayS\":5}" >/dev/null
-    ok "relay fully configured (both folders, all known devices)"
-  else
-    note "open the relay's Syncthing GUI: accept the new device '$(hostname -s)',"
-    note "then accept BOTH folder offers and give each a path on the relay."
-  fi
-
-  # record the relay so indicators show its completion and future folder
-  # updates include it
-  { grep -v "^PEER_DEVICE_$RNAME=" "$CFG" 2>/dev/null || true; } > "$CFG.tmp"
-  if ! grep -q "^PEERS=.*\b$RNAME\b" "$CFG.tmp" 2>/dev/null; then
-    sed -i "s/^PEERS=\"\(.*\)\"/PEERS=\"\1 $RNAME\"/" "$CFG.tmp" 2>/dev/null || echo "PEERS=\"$RNAME\"" >> "$CFG.tmp"
-  fi
-  echo "PEER_DEVICE_$RNAME=\"$RID\"" >> "$CFG.tmp"
-  mv "$CFG.tmp" "$CFG"
-  ok "relay '$RNAME' recorded in $CFG — done"
-  exit 0
-fi
 
 # ---------- peer -------------------------------------------------------------
 say "peer"
@@ -216,14 +139,14 @@ papi() { ssh -o BatchMode=yes "$PEER" "curl -s -m 10 -H 'X-API-Key: $PKEY' 'http
 PEER_ID=$(papi system/status | python3 -c 'import json,sys; print(json.load(sys.stdin)["myID"])')
 ok "peer syncthing device: ${PEER_ID:0:7}…"
 
-# ---------- pair + share both folders -----------------------------------------
-say "pairing syncthing and sharing the projects + sessions folders"
+# ---------- pair + share folder ---------------------------------------------
+say "pairing syncthing and sharing the projects folder"
 lapi "config/devices/$PEER_ID" -X PUT -H "Content-Type: application/json" \
   -d "{\"deviceID\":\"$PEER_ID\",\"name\":\"$PEER\"}" >/dev/null
 papi "config/devices/$LOCAL_ID" "-X PUT -H 'Content-Type: application/json' -d '{\"deviceID\":\"$LOCAL_ID\",\"name\":\"$(hostname -s)\"}'" >/dev/null
 vers='"versioning":{"type":"trashcan","params":{"cleanoutDays":"30"}}'
 devs="\"devices\":[{\"deviceID\":\"$LOCAL_ID\"},{\"deviceID\":\"$PEER_ID\"}"
-# include any previously-configured devices so the mesh stays complete
+# include any previously-configured peers so the mesh stays complete
 for p in ${PEERS:-}; do
   v="PEER_DEVICE_$p"; [[ -n "${!v:-}" && "${!v}" != "$PEER_ID" ]] && devs+=",{\"deviceID\":\"${!v}\"}"
 done
@@ -232,42 +155,20 @@ lapi "config/folders/$FOLDER_ID" -X PUT -H "Content-Type: application/json" \
   -d "{\"id\":\"$FOLDER_ID\",\"label\":\"Claude projects\",\"path\":\"$LOCAL_ROOT\",$devs,$vers}" >/dev/null
 papi "config/folders/$FOLDER_ID" "-X PUT -H 'Content-Type: application/json' -d '{\"id\":\"$FOLDER_ID\",\"label\":\"Claude projects\",\"path\":\"$PROOT\",$devs,$vers}'" >/dev/null
 scp -q "$LOCAL_ROOT/.stignore" "$PEER:'$PROOT/.stignore'" 2>/dev/null || true
-mkdir -p "$HOME/.claude/sync-staging"
-ssh -o BatchMode=yes "$PEER" 'mkdir -p ~/.claude/sync-staging'
-lapi "config/folders/$SESS_ID" -X PUT -H "Content-Type: application/json" \
-  -d "{\"id\":\"$SESS_ID\",\"label\":\"Claude sessions\",\"path\":\"$HOME/.claude/sync-staging\",$devs,\"fsWatcherDelayS\":5}" >/dev/null
-papi "config/folders/$SESS_ID" "-X PUT -H 'Content-Type: application/json' -d '{\"id\":\"$SESS_ID\",\"label\":\"Claude sessions\",\"path\":\"$PHOME/.claude/sync-staging\",$devs,\"fsWatcherDelayS\":5}'" >/dev/null
-ok "folders '$FOLDER_ID' + '$SESS_ID' shared both ways"
+ok "folder '$FOLDER_ID' shared both ways (30-day trash can)"
 
 # ---------- deploy peer tools + config ----------------------------------------
 say "deploying peer tools"
-ssh -o BatchMode=yes "$PEER" 'mkdir -p ~/.local/bin ~/.local/share/claude-sync ~/.config/claude-sync ~/.claude/sync-staging'
-scp -q "$(csbin claude-mv-project)" "$(csbin claude-session-translate)" \
-       "$(csbin claude-sync-check-update)" "$PEER:.local/bin/"
-ssh -o BatchMode=yes "$PEER" 'chmod +x ~/.local/bin/claude-mv-project ~/.local/bin/claude-session-translate ~/.local/bin/claude-sync-check-update'
+ssh -o BatchMode=yes "$PEER" 'mkdir -p ~/.local/bin ~/.local/share/claude-sync ~/.config/claude-sync ~/.claude'
+scp -q "$(csbin claude-mv-project)" "$PEER:.local/bin/"
 ssh -o BatchMode=yes "$PEER" "cat > ~/.config/claude-sync/config" <<PEERCFG
 # claude-sync peer configuration (generated by claude-sync-setup)
 ROLE="peer"
 LOCAL_ROOT="$PROOT"
-LOCAL_HOME="$PHOME"
 ST_FOLDER_ID="$FOLDER_ID"
-ST_SESSIONS_FOLDER_ID="$SESS_ID"
 HUB_DEVICE_ID="$LOCAL_ID"
 HUB_NAME="$(hostname -s)"
 PEERCFG
-# the translator runs locally on the peer every 2 minutes
-if [[ "$POS" == "Darwin" ]]; then
-  ssh -o BatchMode=yes "$PEER" "sed \"s|__HOME__|\$HOME|g\" > ~/Library/LaunchAgents/com.claude-sync.translate.plist" \
-    < "$(share_path peer-files/claude-sync-translate.plist)"
-  ssh -o BatchMode=yes "$PEER" 'launchctl bootout "gui/$(id -u)/com.claude-sync.translate" 2>/dev/null; launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.claude-sync.translate.plist' \
-    && ok "translate agent installed on peer" || note "bootstrap the translate agent on the peer manually"
-else
-  ssh -o BatchMode=yes "$PEER" 'mkdir -p ~/.config/systemd/user
-printf "[Unit]\nDescription=Translate Claude Code sessions to/from the synced staging store\n[Service]\nType=oneshot\nExecStart=%%h/.local/bin/claude-session-translate\nNice=10\n" > ~/.config/systemd/user/claude-session-sync.service
-printf "[Unit]\nDescription=Run claude-session-translate every 2 minutes\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=2min\n[Install]\nWantedBy=timers.target\n" > ~/.config/systemd/user/claude-session-sync.timer
-systemctl --user daemon-reload && systemctl --user enable --now claude-session-sync.timer && loginctl enable-linger $USER' \
-    && ok "translate timer installed on peer" || note "enable the translate timer on the peer manually"
-fi
 if [[ "$POS" == "Darwin" ]]; then
   scp -q "$(share_path peer-files/claude-sync.60s.sh)" "$PEER:.swiftbar/claude-sync.60s.sh" 2>/dev/null \
     || { ssh -o BatchMode=yes "$PEER" 'mkdir -p ~/.swiftbar'; scp -q "$(share_path peer-files/claude-sync.60s.sh)" "$PEER:.swiftbar/"; }
@@ -299,7 +200,6 @@ NEW_PEERS="${PEERS:-}"
   echo "LOCAL_HOME=\"$HOME\""
   echo "LOCAL_DEVICE_ID=\"$LOCAL_ID\""
   echo "ST_FOLDER_ID=\"$FOLDER_ID\""
-  echo "ST_SESSIONS_FOLDER_ID=\"$SESS_ID\""
   echo "MAX_AGE_DAYS=${MAX_AGE_DAYS:-45}"
   for p in $NEW_PEERS; do
     if [[ "$p" == "$PEER" ]]; then

@@ -55,8 +55,8 @@ Migrations preserve mtimes, disambiguate Claude's lossy path encoding by reading
 Since v3 every device syncs symmetrically (each runs its own translator on a 2-minute timer). Setup is driven from a Linux machine:
 
 ```bash
-./install-linux.sh     # installs the tools (needs python3-pyqt6)
-claude-sync-setup      # interactive wizard — connects a peer end to end
+./install-linux.sh     # from a clone (needs python3-pyqt6) — or: sudo apt install ./claude-sync_*.deb from the releases page
+claude-sync-setup      # interactive wizard — connects a device end to end
 ```
 
 The wizard asks two things — where your projects live, and the peer's address — and does the rest:
@@ -107,6 +107,7 @@ Roots may differ per machine — the canonical staging form is machine-agnostic.
 | `mac/claude-rename-project` | native-dialog proactive rename |
 | `mac/claude-sync-translate.plist` | translate LaunchAgent template |
 | `mac/claude-sync.60s.sh`, `mac/swiftbar.plist` | SwiftBar fallback (no Xcode CLT) |
+| `packaging/` | `.deb` and `.dmg` release builders |
 | `VERSION` | release version, shown in both indicators |
 
 ## Caveats (learned the hard way)
