@@ -203,7 +203,7 @@ else
     parch="$(ssh -o BatchMode=yes "$PEER" uname -m)"; case "$parch" in x86_64) pa=amd64;; aarch64|arm64) pa=arm64;; *) die "unsupported peer arch $parch";; esac
     ssh -o BatchMode=yes "$PEER" "mkdir -p ~/.local/bin && url=\$(curl -sL https://api.github.com/repos/syncthing/syncthing/releases/latest | grep -o '\"browser_download_url\": *\"[^\"]*linux-$pa[^\"]*\.tar\.gz\"' | cut -d'\"' -f4 | head -1) && curl -sL \"\$url\" | tar xz -C /tmp && find /tmp -maxdepth 2 -name syncthing -type f -exec cp {} ~/.local/bin/ \;" || die "peer install failed"
   fi
-  ssh -o BatchMode=yes "$PEER" 'mkdir -p ~/.config/systemd/user && printf "[Unit]\nDescription=Syncthing\nAfter=network.target\n[Service]\nExecStart=%%h/.local/bin/syncthing serve --no-browser --no-restart --logflags=0\nRestart=on-failure\nSuccessExitStatus=3 4\n[Install]\nWantedBy=default.target\n" > ~/.config/systemd/user/syncthing.service; systemctl --user daemon-reload && systemctl --user enable --now syncthing.service && loginctl enable-linger $USER' \
+  ssh -o BatchMode=yes "$PEER" 'mkdir -p ~/.config/systemd/user && printf "[Unit]\nDescription=Syncthing\nAfter=network.target\n[Service]\nExecStart=%%h/.local/bin/syncthing serve --no-browser --no-restart --logflags=0\nRestart=on-failure\nSuccessExitStatus=3 4\nRestartForceExitStatus=3 4\n[Install]\nWantedBy=default.target\n" > ~/.config/systemd/user/syncthing.service; systemctl --user daemon-reload && systemctl --user enable --now syncthing.service && loginctl enable-linger $USER' \
     || note "could not enable peer systemd unit over ssh — start syncthing on the peer manually once"
 fi
 note "waiting for peer syncthing to come up…"
