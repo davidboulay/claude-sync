@@ -70,8 +70,46 @@ migrate_store() {
   [[ "$moved" == 1 ]] || echo "  (no session store found for $old_abs — nothing to migrate)"
 }
 
+# the synced staging store keeps canonical copies — migrate them too, or the
+# translators re-import the old name forever
+migrate_staging() {
+  [[ -d "$STAGE" ]] || return 0
+  local pfx tag
+  if [[ "$BASEPATH" == "$ROOT" ]]; then pfx="R"; tag="__CLAUDE_ROOT__"
+  elif [[ "$BASEPATH" == "${LOCAL_HOME:-$HOME}" ]]; then pfx="H"; tag="__CLAUDE_HOME__"
+  else return 0; fi
+  local enc_o enc_n d nd sf tmp f cwd
+  enc_o="$pfx-$(encode "$OLD")"
+  enc_n="$pfx-$(encode "$NEW")"
+  for d in "$STAGE/$enc_o" "$STAGE/$enc_o-"*; do
+    [[ -d "$d" ]] || continue
+    f="$(find "$d" -maxdepth 1 -name '*.jsonl' 2>/dev/null | head -1)"
+    if [[ -n "$f" ]]; then
+      cwd="$(grep -m1 -o '"cwd":"[^"]*"' "$f" | head -1 | cut -d'"' -f4)"
+      if [[ -n "$cwd" && "$cwd" != "$tag/$OLD" && "$cwd" != "$tag/$OLD"/* ]]; then
+        continue
+      fi
+    fi
+    while IFS= read -r -d '' sf; do
+      tmp="$(mktemp "$(dirname -- "$sf")/.sync.XXXXXX")"
+      sed -e "s|$tag/$OLD/|$tag/$NEW/|g" -e "s|$tag/$OLD\"|$tag/$NEW\"|g" "$sf" > "$tmp"
+      touch -r "$sf" "$tmp"
+      mv -f "$tmp" "$sf"
+    done < <(find "$d" -type f ! -name '.sync.*' -print0)
+    nd="$STAGE/$enc_n${d#"$STAGE/$enc_o"}"
+    if [[ -e "$nd" ]]; then
+      cp -a "$d"/. "$nd"/ && rm -rf "$d"
+      echo "  ✓ staging: $(basename -- "$d") merged into $(basename -- "$nd")"
+    else
+      mv "$d" "$nd"
+      echo "  ✓ staging: $(basename -- "$d") → $(basename -- "$nd")"
+    fi
+  done
+}
+
 if [[ "$STORE_ONLY" == 1 ]]; then
   migrate_store
+  migrate_staging
   exit 0
 fi
 
@@ -103,6 +141,7 @@ fi
 
 echo "migrating local session store…"
 migrate_store
+migrate_staging
 
 # queue the store migration for every other device — each one's translator
 # applies it from the synced staging folder (works even if they're asleep now)
