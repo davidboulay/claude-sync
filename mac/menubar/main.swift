@@ -4,7 +4,9 @@
 //
 // Status semantics (deliberate):
 //   green = everything delivered, hub reachable or not needed
-//   blue  = hub offline but NOTHING queued — calm, just informational
+//   green = this Mac and the relay are fully current (offline peers are normal)
+//   amber = something is lagging: local, relay, or an active transfer
+//   red   = the relay (sync backbone) is offline, or local Syncthing is down
 //   amber = data queued (for an offline hub, or transferring), or stale heartbeat
 //   red   = local Syncthing down
 import AppKit
@@ -69,7 +71,7 @@ struct StatusLine {
         case "✓": return NSColor.systemGreen
         case "◐": return NSColor.systemOrange
         case "●": return NSColor.systemOrange
-        case "○": return NSColor.systemBlue
+        case "○": return NSColor.systemGray
         case "✗": return NSColor.systemRed
         default:  return NSColor.systemGray
         }
@@ -174,11 +176,15 @@ func fetchStatus() -> SyncStatus {
     }
 
     var health = Health.green
-    var queuedForOfflineHub = false
+    var lagging = false
 
     let conns = json(httpGET("\(base)/system/connections", apiKey: key))?["connections"] as? [String: Any]
-    let hubConn = ((conns?[hubID] as? [String: Any])?["connected"] as? Bool) ?? false
+    let relayID = cfg["RELAY_DEVICE_ID"]
+    let relayName = cfg["RELAY_NAME", default: "relay"]
 
+    func connected(_ device: String) -> Bool {
+        ((conns?[device] as? [String: Any])?["connected"] as? Bool) ?? false
+    }
     func completion(_ device: String?) -> (pct: Double, need: Int)? {
         var url = "\(base)/db/completion?folder=\(folder)"
         if let d = device { url += "&device=\(d)" }
@@ -187,55 +193,55 @@ func fetchStatus() -> SyncStatus {
               let need = j["needBytes"] as? Int else { return nil }
         return (pct, need)
     }
-    let here = completion(nil)
-    let hub = hubID.isEmpty ? nil : completion(hubID)
 
-    if hubConn {
-        st.lines.append(StatusLine(symbol: "✓", text: "\(hubName) connected"))
-        if let h = here, h.need > 0 {
-            st.lines.append(StatusLine(symbol: "◐", text: String(format: "this Mac: %.0f%% (%d MB left)", h.pct, h.need / 1_000_000)))
-            health = .amber
-        }
-        if let h = hub, h.need > 0 {
-            st.lines.append(StatusLine(symbol: "◐", text: String(format: "\(hubName): %.0f%% (%d MB left)", h.pct, h.need / 1_000_000)))
-            health = .amber
-        }
-        if (here?.need ?? 0) == 0 && (hub?.need ?? 0) == 0 {
-            st.lines.append(StatusLine(symbol: "✓", text: "projects fully mirrored"))
-        }
-    } else {
-        // the point-1 distinction: offline-with-queue vs offline-clean
-        let queued = hub?.need ?? 0
-        if queued > 0 {
-            st.lines.append(StatusLine(symbol: "●", text: "\(hubName) offline — \(queued / 1_000_000) MB queued, delivers when it's back"))
-            health = .amber
-            queuedForOfflineHub = true
+    if let h = completion(nil), h.need > 0 {
+        st.lines.append(StatusLine(symbol: "◐", text: String(format: "this Mac: %.0f%% (%d MB left)", h.pct, h.need / 1_000_000)))
+        lagging = true
+    }
+    // the relay is the backbone: it being down is the red condition
+    if !relayID.isEmpty {
+        if connected(relayID) {
+            if let d = completion(relayID), d.need > 0 {
+                st.lines.append(StatusLine(symbol: "◐", text: String(format: "\(relayName) (relay): %.0f%% (%d MB left)", d.pct, d.need / 1_000_000)))
+                lagging = true
+            } else {
+                st.lines.append(StatusLine(symbol: "✓", text: "\(relayName) (relay) up to date"))
+            }
         } else {
-            st.lines.append(StatusLine(symbol: "○", text: "\(hubName) offline — nothing pending, fully delivered"))
-            if health == .green { health = .blue }
-        }
-        if let h = here, h.need > 0 {
-            st.lines.append(StatusLine(symbol: "●", text: "this Mac awaits \(h.need / 1_000_000) MB (arrives when peers return)"))
+            st.lines.append(StatusLine(symbol: "✗", text: "\(relayName) (relay) OFFLINE — sync backbone down"))
+            health = .red
         }
     }
+    // other devices being offline is normal — informational only
+    if !hubID.isEmpty && hubID != relayID {
+        if connected(hubID) {
+            if let d = completion(hubID), d.need > 0 {
+                st.lines.append(StatusLine(symbol: "◐", text: String(format: "\(hubName): %.0f%% (%d MB left)", d.pct, d.need / 1_000_000)))
+                lagging = true
+            } else {
+                st.lines.append(StatusLine(symbol: "✓", text: "\(hubName) connected, up to date"))
+            }
+        } else {
+            st.lines.append(StatusLine(symbol: "○", text: "\(hubName) offline (catches up via \(relayName))"))
+        }
+    }
+    if lagging && health == .green { health = .amber }
+    if !lagging && health == .green {
+        st.lines.append(StatusLine(symbol: "✓", text: "everything this Mac touches is up to date"))
+    }
 
-    // session-sync heartbeat stamped by the hub
+    // heartbeat of the LOCAL translator (it runs on this Mac every 2 min)
     let hbPath = NSString(string: "~/.claude/.claude-sync-heartbeat").expandingTildeInPath
-    let hbLegacy = NSString(string: "~/.claude/.last-sync-from-linux").expandingTildeInPath
-    let hb = FileManager.default.fileExists(atPath: hbPath) ? hbPath : hbLegacy
-    if let txt = try? String(contentsOfFile: hb, encoding: .utf8), let ts = Double(txt.trimmingCharacters(in: .whitespacesAndNewlines)) {
+    if let txt = try? String(contentsOfFile: hbPath, encoding: .utf8), let ts = Double(txt.trimmingCharacters(in: .whitespacesAndNewlines)) {
         let mins = Int(Date().timeIntervalSince1970 - ts) / 60
         if mins < 15 {
-            st.lines.append(StatusLine(symbol: "✓", text: "sessions: synced \(mins) min ago"))
-        } else if hubConn {
-            st.lines.append(StatusLine(symbol: "●", text: "sessions: last sync \(mins) min ago (timer stuck on \(hubName)?)"))
-            health = .amber
+            st.lines.append(StatusLine(symbol: "✓", text: "sessions: translated \(mins) min ago"))
         } else {
-            st.lines.append(StatusLine(symbol: "○", text: "sessions: last sync \(mins) min ago (\(hubName) offline)"))
-            if health == .green { health = .blue }
+            st.lines.append(StatusLine(symbol: "●", text: "sessions: translator last ran \(mins) min ago"))
+            if health == .green { health = .amber }
         }
     } else {
-        st.lines.append(StatusLine(symbol: "?", text: "sessions: no sync heartbeat yet"))
+        st.lines.append(StatusLine(symbol: "?", text: "sessions: no translator heartbeat yet"))
     }
 
     st.renames = detectRenames(root: root)
@@ -249,7 +255,6 @@ func fetchStatus() -> SyncStatus {
         st.lines.append(StatusLine(symbol: "○", text: "new version synced — reinstall pending"))
     }
 
-    _ = queuedForOfflineHub
     st.health = health
     return st
 }

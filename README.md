@@ -34,7 +34,7 @@ Everything travels over Syncthing; no machine ever needs another one awake. An a
 
 ## Status indicators
 
-Health badge colors on both platforms: **green** = all delivered · **blue** = a peer is offline but nothing is queued for it · **amber** = data queued or transferring, or an update is pending · **red** = a local service is down.
+Health badge colors on both platforms — binary by design, relay-centric: **green** = this machine and the relay are fully current (other devices being offline is normal; their data waits on the relay) · **amber** = something is actually lagging (local, relay, an active transfer, an orphaned store, or a pending update) · **red** = the relay (sync backbone) is offline, or a local service is down.
 
 - **Linux**: a PyQt6 tray icon (`claude-sync-tray`). Left-click opens a popup card (installed version in the header, ✕ or click-outside to close): per-device translate heartbeats, mirror completion, orphaned-store detection with one-click repair, and every action — *Update now* (when applicable), *Sync now*, *Rename project…*, *Syncthing GUI*, *Full status (terminal)*, *Quit*. Survives panel restarts (StatusNotifierWatcher gating). `claude-sync-status` gives the same report in a terminal.
 - **Mac**: a native compiled menu-bar app (**Claude Sync.app**, `mac/menubar/`, built by the installer when Xcode CLT is present; a SwiftBar plugin ships as fallback). Same status lines and actions, version in the header, *Check for updates…* on demand.

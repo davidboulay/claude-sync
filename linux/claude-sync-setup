@@ -145,11 +145,13 @@ print(json.dumps(d))" | lapi "config/folders/$id" -X PUT -H "Content-Type: appli
 
   # record the relay so indicators show its completion and future folder
   # updates include it
-  { grep -v "^PEER_DEVICE_$RNAME=" "$CFG" 2>/dev/null || true; } > "$CFG.tmp"
+  { grep -vE "^(PEER_DEVICE_$RNAME|RELAY_DEVICE_ID|RELAY_NAME)=" "$CFG" 2>/dev/null || true; } > "$CFG.tmp"
   if ! grep -q "^PEERS=.*\b$RNAME\b" "$CFG.tmp" 2>/dev/null; then
     sed -i "s/^PEERS=\"\(.*\)\"/PEERS=\"\1 $RNAME\"/" "$CFG.tmp" 2>/dev/null || echo "PEERS=\"$RNAME\"" >> "$CFG.tmp"
   fi
   echo "PEER_DEVICE_$RNAME=\"$RID\"" >> "$CFG.tmp"
+  echo "RELAY_DEVICE_ID=\"$RID\"" >> "$CFG.tmp"
+  echo "RELAY_NAME=\"$RNAME\"" >> "$CFG.tmp"
   mv "$CFG.tmp" "$CFG"
   ok "relay '$RNAME' recorded in $CFG — done"
   exit 0
@@ -254,6 +256,8 @@ ST_FOLDER_ID="$FOLDER_ID"
 ST_SESSIONS_FOLDER_ID="$SESS_ID"
 HUB_DEVICE_ID="$LOCAL_ID"
 HUB_NAME="$(hostname -s)"
+RELAY_DEVICE_ID="${RELAY_DEVICE_ID:-}"
+RELAY_NAME="${RELAY_NAME:-relay}"
 PEERCFG
 # the translator runs locally on the peer every 2 minutes
 if [[ "$POS" == "Darwin" ]]; then

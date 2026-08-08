@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Panel tray indicator for Claude Linux<->Mac sync health.
 
-Badge colors: green = healthy & mirrored, amber = Mac away or transfer
-running, red = a local service is down.
+Badge colors — binary by design, relay-centric:
+green = this machine and the relay are fully current (offline peers are
+normal), amber = something is lagging (local, relay, active transfer,
+orphaned store, pending update), red = the relay/backbone is offline or a
+local service is down.
 
 Left-click toggles a popup status card (single instance; closes when you
 click anywhere outside it). Right-click for the menu.
@@ -51,6 +54,8 @@ SESSION_STORE = Path(os.environ.get("CS_STORE", Path.home() / ".claude/projects"
 ST_FOLDER = CONF.get("ST_FOLDER_ID", "claude-projects")
 PEERS = CONF.get("PEERS", "").split()
 PEER_DEVICES = {p: CONF.get(f"PEER_DEVICE_{p}", "") for p in PEERS}
+RELAY_ID = CONF.get("RELAY_DEVICE_ID", "")
+RELAY_NAME = CONF.get("RELAY_NAME", "relay")
 
 
 def tool(name):
@@ -76,7 +81,7 @@ COLORS = {"green": "#4caf50", "blue": "#4a90d9", "amber": "#e0a030",
           "red": "#d84040", "gray": "#909090"}
 CLAUDE_TERRACOTTA = "#D97757"
 LOGO_PATH = Path.home() / ".local/share/claude-sync/claude-logo.png"
-LINE_COLORS = {"✓": "#6cbf6c", "●": "#e0a030", "◐": "#e0a030", "○": "#4a90d9",
+LINE_COLORS = {"✓": "#6cbf6c", "●": "#e0a030", "◐": "#e0a030", "○": "#909090",
                "✗": "#d84040", "?": "#909090"}
 
 
@@ -216,38 +221,44 @@ def check_status():
         try:
             conns = st_api("system/connections")["connections"]
             here = st_api(f"db/completion?folder={ST_FOLDER}")
-            pending = here["needBytes"]
-            if pending > 0:
+            lagging = here["needBytes"] > 0
+            if lagging:
                 lines.append(f"◐ this machine: {here['completion']:.0f}% "
-                             f"({pending // 1_000_000} MB left)")
+                             f"({here['needBytes'] // 1_000_000} MB left)")
+            # the relay is the backbone: it being down is a red condition
+            if RELAY_ID:
+                r_conn = conns.get(RELAY_ID, {}).get("connected", False)
+                if r_conn:
+                    d = st_api(f"db/completion?folder={ST_FOLDER}&device={RELAY_ID}")
+                    if d["needBytes"] > 0:
+                        lines.append(f"◐ {RELAY_NAME} (relay): {d['completion']:.0f}% "
+                                     f"({d['needBytes'] // 1_000_000} MB left)")
+                        lagging = True
+                    else:
+                        lines.append(f"✓ {RELAY_NAME} (relay) up to date")
+                else:
+                    lines.append(f"✗ {RELAY_NAME} (relay) OFFLINE — sync backbone down")
+                    color = "red"
+            # other devices being offline is normal — informational only
             for p in PEERS:
                 did = PEER_DEVICES.get(p)
-                if not did:
+                if not did or did == RELAY_ID:
                     continue
                 p_conn = conns.get(did, {}).get("connected", False)
-                d = st_api(f"db/completion?folder={ST_FOLDER}&device={did}")
-                pending += d["needBytes"]
                 if p_conn:
-                    lines.append(f"✓ {p} connected")
+                    d = st_api(f"db/completion?folder={ST_FOLDER}&device={did}")
                     if d["needBytes"] > 0:
                         lines.append(f"◐ {p}: {d['completion']:.0f}% "
                                      f"({d['needBytes'] // 1_000_000} MB left)")
-                        if color == "green":
-                            color = "amber"
-                elif d["needBytes"] > 0:
-                    # offline WITH data queued — worth amber attention
-                    lines.append(f"● {p} offline — "
-                                 f"{d['needBytes'] // 1_000_000} MB queued, "
-                                 "delivers when it's back")
-                    if color == "green":
-                        color = "amber"
+                        lagging = True
+                    else:
+                        lines.append(f"✓ {p} connected, up to date")
                 else:
-                    # offline but fully delivered — calm blue, not a warning
-                    lines.append(f"○ {p} offline — nothing pending")
-                    if color == "green":
-                        color = "blue"
-            if pending == 0:
-                lines.append("✓ projects fully mirrored")
+                    lines.append(f"○ {p} offline (catches up via {RELAY_NAME})")
+            if lagging and color == "green":
+                color = "amber"
+            if not lagging and color == "green":
+                lines.append("✓ everything this machine touches is up to date")
         except Exception:
             lines.append("? syncthing API not answering")
             if color == "green":
