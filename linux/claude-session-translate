@@ -9,9 +9,11 @@
 #   stage ~/.claude/sync-staging/R-<name>/…         __CLAUDE_ROOT__ placeholders
 #                              /H-<name>/…          __CLAUDE_HOME__ (outside root)
 #                              /_user/{skills,agents,commands}
-#                              /_control/heartbeat-<host>, renames-<host>
+#                              /_control/heartbeat-<host>, renames-<host>,
+#                                        deletes-<host>
 #
-# Newest-wins per file, mtimes preserved (idempotent), never deletes.
+# Newest-wins per file, mtimes preserved (idempotent), never deletes on its
+# own — explicit deletions arrive via the deletes queue (claude-rm-project).
 # Applies rename queues from other hosts (claude-mv-project --store-only).
 set -uo pipefail
 
@@ -112,10 +114,31 @@ for qf in "$STAGE/_control"/renames-*; do
   done < "$qf"
 done
 
-# canonical dirs renamed away (and not since recreated) must never be
-# re-imported from staging — collect tombstones from every rename queue
+# --- apply delete queues (claude-rm-project on some host) ----------------------
+# a queued deletion purges the project's store here too; the tombstones below
+# then keep every device from re-importing or re-exporting it
+APPLIED_DEL="$HOME/.local/share/claude-sync/applied-deletes"
+touch "$APPLIED_DEL"
+for qf in "$STAGE/_control"/deletes-*; do
+  [ -f "$qf" ] || continue
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    grep -qxF "$line" "$APPLIED_DEL" && continue
+    name="$(printf '%s' "$line" | cut -d'|' -f3)"
+    [ -n "$name" ] || continue
+    # folder (re)created here — not deleted on this machine (yet); retry later
+    [ -e "$ROOT/$name" ] && continue
+    canon="R-$(encode "$name")"
+    rm -rf "${LIVE:?}/$(to_live "$canon")" "${STAGE:?}/$canon"
+    echo "$line" >> "$APPLIED_DEL"
+    echo "purged sessions of deleted project: $name"
+  done < "$qf"
+done
+
+# canonical dirs renamed away or deleted (and not since recreated) must never
+# be re-imported from staging — collect tombstones from every queue
 TOMBS=""
-for qf in "$STAGE/_control"/renames-*; do
+for qf in "$STAGE/_control"/renames-* "$STAGE/_control"/deletes-*; do
   [ -f "$qf" ] || continue
   while IFS='|' read -r _ _ told _; do
     [ -n "$told" ] || continue

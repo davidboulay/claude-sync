@@ -8,6 +8,7 @@ mkdir -p ~/.local/bin ~/.swiftbar ~/.local/share/claude-sync ~/Library/LaunchAge
 
 install -m 755 "$REPO/mac/claude-rename-project" ~/.local/bin/
 install -m 755 "$REPO/linux/claude-mv-project" ~/.local/bin/          # shared script
+install -m 755 "$REPO/linux/claude-rm-project" ~/.local/bin/          # shared script
 install -m 755 "$REPO/linux/claude-sync-check-update" ~/.local/bin/   # shared script
 install -m 755 "$REPO/linux/claude-session-translate" ~/.local/bin/   # shared script
 sed "s|__HOME__|$HOME|g" "$REPO/mac/claude-sync-translate.plist" \

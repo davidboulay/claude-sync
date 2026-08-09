@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# claude-rm-project NAME — purge the sessions + memory of a DELETED project,
+# on this machine and (via the synced _control queue) on every other device.
+#
+# The translate engine never deletes on its own; this is the explicit path.
+# The store is archived to ~/.claude/session-archive/ first. Other devices
+# purge their copies when their translator next runs, and the queue doubles
+# as a tombstone so stale copies are never re-imported.
+#
+#   --no-archive   skip the local tarball
+#
+# The project folder itself must already be gone (delete it first);
+# for renames use claude-mv-project.
+set -euo pipefail
+
+CFG="${CLAUDE_SYNC_CONFIG:-$HOME/.config/claude-sync/config}"
+# shellcheck disable=SC1090
+[[ -f "$CFG" ]] && source "$CFG"
+ROOT="${CMP_ROOT:-${LOCAL_ROOT:-$HOME/Claude}}"
+STORE="${CMP_STORE:-$HOME/.claude/projects}"
+STAGE="${CST_STAGE:-$HOME/.claude/sync-staging}"
+HOSTTAG="${CST_HOST:-$(hostname -s | tr -c 'A-Za-z0-9' '-' | sed 's/-*$//')}"
+
+ARCHIVE=1
+if [[ "${1:-}" == "--no-archive" ]]; then ARCHIVE=0; shift; fi
+NAME="${1:?usage: claude-rm-project [--no-archive] NAME}"
+
+if [[ -e "$ROOT/$NAME" ]]; then
+  echo "✗ $ROOT/$NAME still exists — delete the folder first (for renames: claude-mv-project)" >&2
+  exit 1
+fi
+
+encode() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g'; }
+enc_abs="$(encode "$ROOT/$NAME")"
+canon="R-$(encode "$NAME")"
+
+# this machine's store dirs: the exact store plus sub-project stores, each
+# confirmed via a transcript's cwd (the encoding is lossy: foo-bar vs foo/bar)
+targets=()
+for d in "$STORE/$enc_abs" "$STORE/$enc_abs-"*; do
+  [[ -d "$d" ]] || continue
+  if [[ "$d" != "$STORE/$enc_abs" ]]; then
+    f="$(find "$d" -maxdepth 1 -name '*.jsonl' 2>/dev/null | head -1)"
+    [[ -n "$f" ]] || { echo "  ? skipping $d (no session to confirm identity)"; continue; }
+    cwd="$(grep -m1 -o '"cwd":"[^"]*"' "$f" | head -1 | cut -d'"' -f4)"
+    [[ "$cwd" == "$ROOT/$NAME" || "$cwd" == "$ROOT/$NAME"/* ]] || continue
+  fi
+  targets+=("$d")
+done
+[[ -d "$STAGE/$canon" ]] && targets+=("$STAGE/$canon")
+
+if [[ ${#targets[@]} -eq 0 ]]; then
+  echo "nothing to purge locally for '$NAME'"
+else
+  if [[ $ARCHIVE -eq 1 ]]; then
+    adir="$HOME/.claude/session-archive"
+    mkdir -p "$adir"
+    tgz="$adir/$(encode "$NAME")-$(date +%Y%m%d-%H%M%S).tgz"
+    tar czf "$tgz" -C / "${targets[@]/#\//}"
+    echo "  ✓ archived to $tgz"
+  fi
+  rm -rf "${targets[@]}"
+  echo "  ✓ purged ${#targets[@]} dir(s) locally"
+fi
+
+if [[ -d "$STAGE/_control" ]]; then
+  printf '%s|%s|%s\n' "$(date +%s)" "$HOSTTAG" "$NAME" >> "$STAGE/_control/deletes-$HOSTTAG"
+  echo "  ✓ queued for other devices (their translators purge within minutes)"
+else
+  echo "  ⚠ no staging folder — other devices keep their copies"
+fi
+echo "done."

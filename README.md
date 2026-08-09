@@ -28,7 +28,7 @@ Everything travels over Syncthing; no machine ever needs another one awake. An a
 └──────────────┘           └───────────────────┘           └──────────────┘
 ```
 
-- **Sessions, memory, skills** — Claude Code keys session stores to absolute paths, so they can't be mirrored raw. Each device runs `claude-session-translate` every 2 minutes (systemd timer / launchd agent): a **local** two-way merge between the live store and `~/.claude/sync-staging`, a canonical form where machine paths become `__CLAUDE_ROOT__` / `__CLAUDE_HOME__` placeholders. Syncthing mirrors the staging folder across all devices; the relay just stores it (no claude-sync code on the NAS). Newest-wins per file, mtimes preserved (idempotent), **never deletes**, memory synced regardless of age. Projects roots can differ per machine — canonical form is machine-agnostic. Staging also carries `_user/` (skills, agents, commands, no translation needed) and `_control/` (per-host heartbeats and the rename queue).
+- **Sessions, memory, skills** — Claude Code keys session stores to absolute paths, so they can't be mirrored raw. Each device runs `claude-session-translate` every 2 minutes (systemd timer / launchd agent): a **local** two-way merge between the live store and `~/.claude/sync-staging`, a canonical form where machine paths become `__CLAUDE_ROOT__` / `__CLAUDE_HOME__` placeholders. Syncthing mirrors the staging folder across all devices; the relay just stores it (no claude-sync code on the NAS). Newest-wins per file, mtimes preserved (idempotent), **never deletes on its own** (explicit deletions go through `claude-rm-project`, below), memory synced regardless of age. Projects roots can differ per machine — canonical form is machine-agnostic. Staging also carries `_user/` (skills, agents, commands, no translation needed) and `_control/` (per-host heartbeats and the rename/delete queues).
 - **Project files** — plain Syncthing mirror of the projects root with build-junk ignores (`.stignore`) and a 30-day trash can for deletions.
 - **v2 note** — the previous SSH-based engine (`claude-session-sync`) still ships for reference but is no longer wired to the timer.
 
@@ -49,6 +49,8 @@ Because sessions are keyed to absolute paths, renaming a project folder orphans 
 3. **Manual** — `claude-mv-project OLD NEW`, with `--store-only` for a local-only store migration, and `CMP_BASE` for moves from outside the projects root.
 
 Migrations preserve mtimes, disambiguate Claude's lossy path encoding by reading the real `cwd` from transcripts, and merge instead of clobbering when the target store already exists.
+
+**Deleting a project** is the one thing the engine never does implicitly (a deleted folder just makes its sessions show up as orphaned). `claude-rm-project NAME` archives the session store to `~/.claude/session-archive/`, purges it locally and from staging, and queues the deletion through the synced `_control` channel — every other device purges its copy on its next translate run, and the queue doubles as a tombstone so stale copies on devices that haven't caught up yet are never re-imported.
 
 ## Install
 

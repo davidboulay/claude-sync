@@ -18,7 +18,8 @@ install -m 755 "$REPO/linux/claude-session-translate" \
                "$REPO/linux/claude-sync-status" \
                "$REPO/linux/claude-sync-setup" \
                "$REPO/linux/claude-sync-check-update" \
-               "$REPO/linux/claude-mv-project" "$PKG/usr/bin/"
+               "$REPO/linux/claude-mv-project" \
+               "$REPO/linux/claude-rm-project" "$PKG/usr/bin/"
 
 sed 's|%h/.local/bin/claude-session-translate|/usr/bin/claude-session-translate|' \
   "$REPO/linux/systemd/claude-session-sync.service" > "$PKG/usr/lib/systemd/user/claude-session-sync.service"

@@ -13,6 +13,7 @@ ln -s /Applications "$STAGE/Applications"
 
 mkdir -p "$STAGE/.cli" "$STAGE/.cli-support"
 cp "$REPO/linux/claude-session-translate" "$REPO/linux/claude-mv-project" \
+   "$REPO/linux/claude-rm-project" \
    "$REPO/linux/claude-sync-check-update" "$REPO/mac/claude-rename-project" "$STAGE/.cli/"
 cp "$REPO/mac/claude-sync-translate.plist" "$REPO/VERSION" "$STAGE/.cli-support/"
 

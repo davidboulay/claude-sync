@@ -14,7 +14,8 @@ install -m 755 "$REPO/linux/claude-session-translate" \
                "$REPO/linux/claude-sync-tray" \
                "$REPO/linux/claude-sync-setup" \
                "$REPO/linux/claude-sync-check-update" \
-               "$REPO/linux/claude-mv-project" ~/.local/bin/
+               "$REPO/linux/claude-mv-project" \
+               "$REPO/linux/claude-rm-project" ~/.local/bin/
 cp "$REPO"/linux/systemd/claude-session-sync.{service,timer} \
    "$REPO"/linux/systemd/syncthing.service ~/.config/systemd/user/
 sed "s|__HOME__|$HOME|g" "$REPO/linux/desktop/claude-sync-status.desktop" > ~/.local/share/applications/claude-sync-status.desktop
